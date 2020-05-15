@@ -1,0 +1,2428 @@
+    1                  ;
+    2                  ; DISK TEST UTILITY FOR C1P/UK101/C2PDF/C4PMF/C8P/C3-OEM
+    3                  ; Supposed to work with serial or video and 8" or 5.25" floppies. Tested 
+    4                  ; with C2 with 8" floppies, serial, and 540B video. Tested with OSI emulator
+    5                  ; with 5.25" floppies.
+    6                  ; Needs 16k memory.
+    7                  ; Start at $300
+    8                  ; Does write/read or read only test. Disk format is not compatible with
+    9                  ; OSI operating systems. Can either print error information or generate
+   10                  ; a pulse on fault reset to trigger scope on error. Can also show
+   11                  ; drive status lines and allow manual control of drive control lines.
+   12                  ; Will also measure drive RPM
+   13                  ;
+   14                  ; DESTRUCTIVE DISK READ/WRITE TEST
+   15                  ; By David Gesswein djg@pdp8online.com
+   16                  ; Initial release 05/04/2020
+   17                  ; All my changes are released as public domain. The original code did not have
+   18                  ; any license specified.
+   19                  ; For usage see http://www.pdp8online.com/osi/osi-floppy-test.shtml
+   20                  
+   21                  ;BASED ON https://osi.marks-lab.com/software/tools.html Universal OSIDump 
+   22                  ;BASED ON ED'S OSIDUMP UTILITY
+   23                  ;
+   24                  ;
+   25                  
+   26  0300            ORG     =       $0300
+   27                  
+   28  0028            MAXTRK5 =       40      ; # TRACKS TO READ 5 1/4 disk
+   29  000A            MAXPAG5 =       10      ; # PAGES TO READ  5 1/4 disk
+   30  004D            MAXTRK8 =   77  ; # Tracks to read 8 disk
+   31  000F            MAXPAG8 =   15  ; # Pages to read 8 disk
+   32  0877            BYTES5  = 2167
+   33  0E10            BYTES8  = 3600
+   34                  
+   35  C000            DDPIA   =   $C000   ; Disk controller PIA
+   36  C010            DDACIA  =   $C010   ; Disk Controller Serial Port
+   37  FC00            C2ACIA  =   $FC00   ; ACIA on C2/C4/C8/C3
+   38  F000            C1ACIA  =   $F000   ; ACIA on C1
+   39                  
+   40                  ;Control Character Constants XMODEM etc.
+   41  000D            CR              =       $0D
+   42  000A            LF              =       $0A
+   43  001B            ESC             =       $1B             ; ESC to exit
+   44                  
+   45                  
+   46                  ;storage space (anywhere, so why not page zero?)
+   47  0029            STORE   =   $29   ;storage C4P starts stack at 28
+   48  002A            MAXTRK  =   STORE+01 ;1 - 40 for 5.25, 77 for 8, 255 for HD
+   49  002B            MAXPAG  =   STORE+02 ;1 - 9 for 5.25, 15 for 8, 16 for HD
+   50  002C            ACIACTL =   STORE+03 ;1 controls cassette/rs-232 ACIA divisor, format
+   51  002D            DRVNUM  =   STORE+04 ;1 drive# 0-3
+   52  002E            TRK     =   STORE+05 ;1 current track #
+   53  002F            TMP     =   STORE+6  ;1
+   54  0030            MACHINE =   STORE+7  ;1 C1/C2/C3 flag 00=C2/4/8, $40=C3Ser, $80=C1
+   55                  
+   56                  
+   57  0031                    *= STORE+8
+   58  0031  00        VIDEO           .BYTE 0 ; 0 = Serial $FF = video
+   59  0032  00        PATSEL          .BYTE 0 ;  0 = Fixed byte (PATVAL), $FF = random
+   60  0033  00        PATVAL          .BYTE 0 ;  Byte to write to disk
+   61  0034  00        PASSES          .BYTE 0
+   62  0035  00        READONLY        .BYTE 0 ; zero read write
+   63  0036  00        PASSCNTR        .BYTE 0
+   64  0037  5C 9F 89  RND             .BYTE 92, 159, 137, 36, 210, 89
+       003A  24 D2 59  
+   65  003D  00 00 00  RNDHLD          .BYTE 0,0,0,0,0,0
+       0040  00 00 00  
+   66  0043  00 00 00  DIVIDEND        .BYTE 0,0,0
+   67                  ;DIVISOR        .BYTE 0,0,0
+   68  0046  F6 5C 00  DIVISOR         .BYTE $f6,$5c,0
+   69  0049  00 00 00  REMAINDER       .BYTE 0,0,0
+   70  004C  00 00 00  factor2         .BYTE 0,0,0
+   71  004F  00        PZTEMP          .BYTE 0
+   72  0050  00 00 00  MAX             .BYTE 0,0,0
+   73  0053  00 00 00  MIN             .BYTE 0,0,0
+   74  0056  00 00 00  SUM             .BYTE 0,0,0
+   75  0059  00        pad             .BYTE 0
+   76  005A  00 00     ERRCNT          .WORD 0
+   77  005C  00        PRTERR          .BYTE 0
+   78                  ; 8" RPM scale 360 RPM * (250000 bps/10 bits/byte/6 RPS) = 1500000
+   79  005D  60 E3 16  RPMSCALE8       .BYTE $60, $e3, $16 
+   80                  ; 5.25" RPM scale 300 * (125000/10/5) = 750000
+   81  0060  B0 71 0B  RPMSCALE5       .BYTE $b0, $71, $0b 
+   82                  ; Allow 3% fast rotation and 1.25 delay after index high and 2.2 ms index
+   83                  ; pulse;
+   84  0063  00 00     MTRKBYTES       .WORD 0 ; negative number of bytes in track
+   85  0065  00 00     BYTECNTR        .WORD 0
+   86  0067  00        YHOLD           .BYTE 0
+   87  0068  00        TESTTYPE        .BYTE 0 ; 0 normal 1 scope
+   88                  
+   89                  ;zero page storage
+   90  0069  00        DRVACIA         .BYTE 0 ; Current serial word format for DISK ACIA 8E1/8N1
+   91  006A  00 00     PTRSTOR         .WORD 0 
+   92  006C  00 00     TDATA           .WORD 0
+   93  006E  00 00     TDATA2          .WORD 0
+   94  0070  40 D0     VIDSRC          .WORD $D040
+   95  0072  00 D0     VIDDST          .WORD $D000
+   96  0074  00        VIDOFFSET       .BYTE 0
+   97  0075  00        MAXERR          .BYTE 0 ; number of errors + 1 to print
+   98  0076  00        SINGLETRK       .BYTE 0; non zero if testing single track
+   99                  
+  100                          ; Serial monitor start values
+  101  0129                    *= $129
+  102  0129  00 00 00          .BYTE 0,0,0,0,$fd,ORG/256,ORG%256
+       012C  00 FD 03  
+       012F  00        
+  103                  
+  104  0300                    *=      ORG
+  105  0300                    .EXE *        ;A65 emit OSI .lod start address operation
+  106  0300  78                SEI
+  107  0301  AD 01 FE          LDA     $FE01     ;determine machine type
+  108  0304  F0 0B             BEQ     SERTYP    ;Is this serial system?                                                    
+  109  0306  A9 00             LDA     #$00    
+  110  0308  2C 00 DF          BIT     $DF00     ;okay check C1/C2-C4
+  111  030B  30 01             BMI     C1TYPE
+  112  030E            C1TYPE=*+1
+  113  030D  2C A9 80          BIT     $80A9     ;
+  114  0311            SERTYP=*+1
+  115  0310  2C A9 40          BIT     $40A9
+  116  0313  85 30             STA     MACHINE   ;bit 7 = C1, bit 6 = C3, none =C2/C4
+  117  0315  A9 15             LDA     #$15      ;B1 = 8N2 /16 RTStxIRQ  rxIRQ ;$15 = 8N1 /16 RTSNOtxIRQ NOrxIRQ; $B5 = irqs on 8N1
+  118  0317  85 2C             STA     ACIACTL
+  119                          ; Not sure how to figure out if we should use serial or video.
+  120                          ; First try to determine if a serial port exists. If it does we
+  121                          ; print a message to both serial and video and see which the user
+  122                          ; hits a key on to select between video and serial
+  123  0319  A2 02             LDX     #2      ; 2*1.25MS wait for last character to be output
+  124  031B  20 AA 0F          JSR     DELAY
+  125  031E  A2 00             LDX     #0
+  126  0320  20 20 12          JSR     CheckTXReady    ; If serial not ready likely no serial port
+  127  0323  B0 01             BCS     SELLP           
+  128  0325  CA                DEX                     ; so don't write to serial.
+  129  0326            SELLP
+  130  0326  20 E7 11          JSR     Get_Chr         ; Flush serial data if any
+  131  0329  20 E7 11          JSR     Get_Chr         ; Flush serial data if any
+  132  032C  86 31             STX     VIDEO           ; Select serial first then video
+  133  032E  20 B9 0F          JSR     PRINT
+  134  0331  0D 0A 48          .BYTE   CR,LF,'HIT ANY KEY TO SELECT CONSOLE DEVICE',CR,LF,0
+       0334  49 54 20  
+       0337  41 4E 59  
+       033A  20 4B 45  
+       033D  59 20 54  
+       0340  4F 20 53  
+       0343  45 4C 45  
+       0346  43 54 20  
+       0349  43 4F 4E  
+       034C  53 4F 4C  
+       034F  45 20 44  
+       0352  45 56 49  
+       0355  43 45 0D  
+       0358  0A 00     
+  135  035A  CA                DEX
+  136  035B  E0 FE             CPX     #$FE            ; If we did both then we are done
+  137  035D  D0 C7             BNE     SELLP
+  138  035F            SELLP2
+  139  035F  20 E7 11          JSR     Get_Chr         ; Get serial character if one ready
+  140  0362  B0 0C             BCS     SERCON          ; Got one, select serial
+  141  0364  20 C9 11          JSR     Get_Chr_Polled  ; Check polled keyboard for key down
+  142  0367  90 F6             BCC     SELLP2          ; Didn't find it
+  143  0369  A2 FF             LDX     #$FF
+  144  036B  A0 04             LDY     #4              ; Set video console and # of errors to print
+  145  036D  4C 74 03          JMP     STORECON
+  146  0370            SERCON
+  147  0370  A2 00             LDX     #0
+  148  0372  A0 06             LDY     #6              ; Set serial console and # of errors to print
+  149  0374            STORECON
+  150  0374  86 31             STX     VIDEO
+  151  0376  84 75             STY     MAXERR
+  152                  
+  153  0378  A9 00             LDA     #$00    ; Reset various variables
+  154  037A  85 74             STA     VIDOFFSET
+  155  037C  85 2D             STA     DRVNUM
+  156  037E  85 32             STA     PATSEL
+  157  0380  85 68             STA     TESTTYPE
+  158  0382  85 35             STA     READONLY
+  159  0384  85 2E             STA     TRK     ; We don't know the track so set to zero
+  160  0386  A9 01             LDA     #$01
+  161  0388  85 34             STA     PASSES
+  162  038A  A9 18             LDA     #$18
+  163  038C  85 33             STA     PATVAL
+  164  038E  24 30             BIT     MACHINE
+  165  0390  50 03             BVC     *+5
+  166  0392  4C 52 04          JMP     SETDRV8  ;serial systems use 8" by default
+  167  0395  4C 3F 04          JMP     SETDRV5
+  168                  
+  169  0398            TOP
+  170  0398  20 41 10          JSR     DRWMENU ; Print menu
+  171  039B  20 E7 11          JSR     Get_Chr         ; Flush serial data if any
+  172  039E  A2 00             LDX     #$00
+  173  03A0  20 FF 11          JSR     INKEY   ; Key user input
+  174  03A3  20 30 12          JSR     OUTPUT
+  175  03A6  C9 31             CMP     #$31    ; See if its a menu choice and do it
+  176  03A8  D0 03             BNE     *+5
+  177  03AA  4C 9E 08          JMP     TEST
+  178  03AD  C9 32             CMP     #$32
+  179  03AF  D0 03             BNE     *+5
+  180  03B1  4C 65 04          JMP     TESTTRK
+  181  03B4  C9 33             CMP     #$33
+  182  03B6  D0 03             BNE     *+5
+  183  03B8  4C C4 05          JMP     SETDRV
+  184  03BB  C9 34             CMP     #$34
+  185  03BD  D0 03             BNE     *+5
+  186  03BF  4C EE 03          JMP     DRVTYPE
+  187  03C2  C9 35             CMP     #$35
+  188  03C4  D0 03             BNE     *+5
+  189  03C6  4C B8 04          JMP     SETPAT
+  190  03C9  C9 36             CMP     #$36
+  191  03CB  D0 09             BNE     CHECKNEXT
+  192  03CD  A9 FF             LDA     #$FF
+  193  03CF  45 35             EOR     READONLY
+  194  03D1  85 35             STA     READONLY
+  195  03D3  4C 98 03          JMP     TOP
+  196  03D6            CHECKNEXT
+  197  03D6  C9 37             CMP     #$37
+  198  03D8  D0 03             BNE     *+5
+  199  03DA  4C 0A 06          JMP     RPMTEST
+  200  03DD  C9 38             CMP     #$38
+  201  03DF  D0 03             BNE     *+5
+  202  03E1  4C 1C 13          JMP     STATSCRN
+  203  03E4  C9 39             CMP     #$39
+  204  03E6  D0 03             BNE     *+5
+  205  03E8  6C FC FF          JMP     ($FFFC) ;Exit
+  206  03EB  4C 37 04          JMP     INPERR
+  207                  
+  208  03EE            DRVTYPE
+  209  03EE  20 B9 0F          JSR     PRINT
+  210  03F1  0D 0A 45          .BYTE $D,$A,'Enter your disk drive type (8) inch or (5).25 inch? >',0
+       03F4  6E 74 65  
+       03F7  72 20 79  
+       03FA  6F 75 72  
+       03FD  20 64 69  
+       0400  73 6B 20  
+       0403  64 72 69  
+       0406  76 65 20  
+       0409  74 79 70  
+       040C  65 20 28  
+       040F  38 29 20  
+       0412  69 6E 63  
+       0415  68 20 6F  
+       0418  72 20 28  
+       041B  35 29 2E  
+       041E  32 35 20  
+       0421  69 6E 63  
+       0424  68 3F 20  
+       0427  3E 00     
+  211  0429  20 FF 11          JSR     INKEY
+  212  042C  20 30 12          JSR     OUTPUT
+  213  042F  C9 38             CMP     #$38
+  214  0431  F0 1F             BEQ     SETDRV8
+  215  0433  C9 35             CMP     #$35
+  216  0435  F0 08             BEQ     SETDRV5
+  217  0437            INPERR
+  218  0437  A9 3F             LDA     #'?     ; Print bad choice and menu again
+  219  0439  20 30 12          JSR     OUTPUT
+  220  043C  4C 98 03          JMP     TOP
+  221                  
+  222  043F            SETDRV5
+  223  043F  A9 28             LDA     #MAXTRK5
+  224  0441  85 2A             STA     MAXTRK
+  225  0443  A9 0A             LDA     #MAXPAG5
+  226  0445  85 2B             STA     MAXPAG
+  227  0447  A9 89             LDA     #-BYTES5%256
+  228  0449  85 63             STA     MTRKBYTES
+  229  044B  A9 F7             LDA     #-BYTES5/256
+  230  044D  85 64             STA     MTRKBYTES+1
+  231  044F  4C 98 03          JMP     TOP
+  232                  
+  233  0452            SETDRV8
+  234  0452  A9 4D             LDA     #MAXTRK8
+  235  0454  85 2A             STA     MAXTRK
+  236  0456  A9 0F             LDA     #MAXPAG8
+  237  0458  85 2B             STA     MAXPAG
+  238  045A  A9 F0             LDA     #-BYTES8%256
+  239  045C  85 63             STA     MTRKBYTES
+  240  045E  A9 F1             LDA     #-BYTES8/256
+  241  0460  85 64             STA     MTRKBYTES+1
+  242  0462  4C 98 03          JMP     TOP
+  243                  
+  244                  
+  245  0465            TESTTRK
+  246  0465  20 B9 0F          JSR PRINT
+  247  0468  0D 0A 45          .BYTE $D,$A,'Enter 2 digit decimal track to test > ',0
+       046B  6E 74 65  
+       046E  72 20 32  
+       0471  20 64 69  
+       0474  67 69 74  
+       0477  20 64 65  
+       047A  63 69 6D  
+       047D  61 6C 20  
+       0480  74 72 61  
+       0483  63 6B 20  
+       0486  74 6F 20  
+       0489  74 65 73  
+       048C  74 20 3E  
+       048F  20 00     
+  248  0491  20 9E 05          JSR GETDEC2
+  249  0494  90 CF             BCC TESTTRK
+  250  0496  85 67             STA YHOLD
+  251  0498  20 D6 0E          JSR INITPIA
+  252  049B  20 F6 0E          JSR SELDRV
+  253  049E  20 13 0F          JSR TZERO       ; STEP TO TRACK 0
+  254  04A1  90 03             BCC *+5
+  255  04A3  4C 9F 0E          JMP NOTRK
+  256  04A6  A5 67             LDA YHOLD
+  257  04A8  F0 07             BEQ TESTSTART
+  258  04AA            TESTTN
+  259  04AA  20 77 0F          JSR TNEXT       ; Step to desired track
+  260  04AD  C6 67             DEC YHOLD
+  261  04AF  D0 F9             BNE TESTTN
+  262  04B1            TESTSTART
+  263  04B1  A9 01             LDA #1          ; And set flag to only test the one track
+  264  04B3  85 76             STA SINGLETRK
+  265  04B5  4C A2 08          JMP TEST2
+  266                  
+  267  04B8            SETPAT
+  268  04B8  A9 00             LDA #0
+  269  04BA  85 32             STA PATSEL
+  270  04BC  20 B9 0F          JSR PRINT
+  271  04BF  0D 0A 45          .BYTE $D,$A,'Enter hex fill pattern or space for random > ',0
+       04C2  6E 74 65  
+       04C5  72 20 68  
+       04C8  65 78 20  
+       04CB  66 69 6C  
+       04CE  6C 20 70  
+       04D1  61 74 74  
+       04D4  65 72 6E  
+       04D7  20 6F 72  
+       04DA  20 73 70  
+       04DD  61 63 65  
+       04E0  20 66 6F  
+       04E3  72 20 72  
+       04E6  61 6E 64  
+       04E9  6F 6D 20  
+       04EC  3E 20 00  
+  272  04EF  20 FF 11          JSR INKEY
+  273  04F2  20 30 12          JSR OUTPUT
+  274  04F5  29 7F             AND #$7F
+  275  04F7  C9 20             CMP #' '
+  276  04F9  F0 7D             BEQ PATRND
+  277  04FB  20 7D 05          JSR CONVHDIG
+  278  04FE  90 B8             BCC SETPAT
+  279  0500  0A                ASL     ; Shift to high nibble
+  280  0501  0A                ASL
+  281  0502  0A                ASL
+  282  0503  0A                ASL
+  283  0504  AA                TAX
+  284  0505  20 FF 11          JSR INKEY       ; Get and combine with low nibble
+  285  0508  20 30 12          JSR OUTPUT
+  286  050B  20 7D 05          JSR CONVHDIG
+  287  050E  90 A8             BCC SETPAT
+  288  0510  85 2F             STA TMP
+  289  0512  8A                TXA
+  290  0513  05 2F             ORA TMP
+  291  0515  85 33             STA PATVAL
+  292  0517            GETPASSES
+  293  0517  20 B9 0F          JSR PRINT
+  294  051A  0D 0A 45          .BYTE $D,$A,'Enter two digit passes > ',0
+       051D  6E 74 65  
+       0520  72 20 74  
+       0523  77 6F 20  
+       0526  64 69 67  
+       0529  69 74 20  
+       052C  70 61 73  
+       052F  73 65 73  
+       0532  20 3E 20  
+       0535  00        
+  295  0536  20 9E 05          JSR GETDEC2
+  296  0539  90 DC             BCC GETPASSES
+  297  053B  85 34             STA PASSES
+  298                  
+  299  053D            GETTYPE
+  300  053D  20 B9 0F          JSR PRINT
+  301  0540  0D 0A 28          .BYTE $D,$A,'(S)cope test or (N)ormal > ',0
+       0543  53 29 63  
+       0546  6F 70 65  
+       0549  20 74 65  
+       054C  73 74 20  
+       054F  6F 72 20  
+       0552  28 4E 29  
+       0555  6F 72 6D  
+       0558  61 6C 20  
+       055B  3E 20 00  
+  302  055E  20 FF 11          JSR INKEY
+  303  0561  20 30 12          JSR OUTPUT
+  304  0564  29 7F             AND #$7F
+  305  0566  09 20             ORA #$20
+  306  0568  A2 00             LDX #0
+  307  056A  C9 6E             CMP #'n'
+  308  056C  F0 05             BEQ SETTYPE
+  309  056E  E8                INX
+  310  056F  C9 73             CMP #'s'
+  311  0571  D0 CA             BNE GETTYPE
+  312  0573            SETTYPE
+  313  0573  86 68             STX TESTTYPE
+  314  0575  4C 98 03          JMP TOP
+  315  0578            PATRND
+  316  0578  C6 32             DEC PATSEL
+  317  057A  4C 17 05          JMP GETPASSES
+  318                  
+  319  057D            CONVHDIG
+  320  057D  20 8D 05          JSR CONVDIG
+  321  0580  B0 0A             BCS CONVHRET
+  322  0582  C9 61             CMP #'a'
+  323  0584  30 16             BMI CONVERR
+  324  0586  C9 67             CMP #'f'+1
+  325  0588  10 12             BPL CONVERR
+  326  058A  E9 56             SBC #'a'-1-10
+  327  058C            CONVHRET
+  328  058C  60                RTS
+  329  058D            CONVDIG
+  330  058D  29 7F             AND #$7F
+  331  058F  09 20             ORA #$20
+  332  0591  C9 30             CMP #'0'
+  333  0593  30 07             BMI CONVERR
+  334  0595  C9 3A             CMP #'9'+1
+  335  0597  10 03             BPL CONVERR
+  336  0599  E9 2F             SBC #'0'-1
+  337  059B  60                RTS
+  338  059C            CONVERR
+  339  059C  18                CLC
+  340  059D  60                RTS
+  341                  
+  342                  ; Return 2 digit decimal number in A. Carry clear if number valid
+  343  059E            GETDEC2
+  344  059E  20 FF 11          JSR INKEY
+  345  05A1  20 30 12          JSR OUTPUT
+  346  05A4  20 8D 05          JSR CONVDIG
+  347  05A7  90 1A             BCC GETDEC2RET
+  348  05A9  85 2F             STA TMP
+  349  05AB  0A                ASL             ; Multiply by 8
+  350  05AC  0A                ASL
+  351  05AD  0A                ASL
+  352  05AE  65 2F             ADC TMP         ; And add twice to make multiply by 10
+  353  05B0  65 2F             ADC TMP
+  354  05B2  85 2F             STA TMP
+  355  05B4  20 FF 11          JSR INKEY       ; Get and add low digit
+  356  05B7  20 30 12          JSR OUTPUT
+  357  05BA  20 8D 05          JSR CONVDIG
+  358  05BD  90 04             BCC GETDEC2RET
+  359  05BF  18                CLC
+  360  05C0  65 2F             ADC TMP
+  361  05C2  38                SEC
+  362  05C3            GETDEC2RET              ; Not valid number, return carry clear
+  363  05C3  60                RTS
+  364                  
+  365  05C4            SETDRV
+  366  05C4  20 B9 0F          JSR PRINT
+  367  05C7  0D 0A 53          .BYTE $D,$A,'Select drive (A), (B), (C), (D) ? >',0
+       05CA  65 6C 65  
+       05CD  63 74 20  
+       05D0  64 72 69  
+       05D3  76 65 20  
+       05D6  28 41 29  
+       05D9  2C 20 28  
+       05DC  42 29 2C  
+       05DF  20 28 43  
+       05E2  29 2C 20  
+       05E5  28 44 29  
+       05E8  20 3F 20  
+       05EB  3E 00     
+  368  05ED  20 FF 11          JSR INKEY
+  369  05F0  20 30 12          JSR OUTPUT
+  370  05F3  29 5F             AND #$5F
+  371  05F5  C9 41             CMP #'A
+  372  05F7  90 0B             BCC SETERR
+  373  05F9  C9 45             CMP #'E
+  374  05FB  B0 07             BCS SETERR
+  375  05FD  E9 40             SBC #'@         ;carry is clear so val -1
+  376  05FF  85 2D             STA DRVNUM
+  377  0601  4C 98 03          JMP TOP
+  378  0604            SETERR
+  379  0604  4C 37 04          JMP INPERR
+  380                  
+  381  0607            NOTRK2
+  382  0607  4C 9F 0E          JMP NOTRK
+  383                          ; Test drive RPM with head unloaded and loaded
+  384                          ; We count number of bytes sent through disk serial port between
+  385                          ; index pulses to measure RPM. That is independent of CPU speed.
+  386                          ; We use 8N1 for 10 total bits.
+  387                          ; 8" = 25,000 characters per second and 5.25" 12,500.
+  388                          ; 16 measurements are done with minimum, maximum, and avarage
+  389                          ; printed
+  390  060A            RPMTEST
+  391  060A  20 D6 0E          JSR INITPIA
+  392  060D  20 F6 0E          JSR SELDRV
+  393  0610  20 13 0F          JSR TZERO       ; STEP TO TRACK 0
+  394  0613  B0 F2             BCS NOTRK2
+  395  0615  A9 03             LDA #3
+  396  0617  8D 10 C0          STA DDACIA      ; RESET ACIA
+  397  061A  A9 54             LDA #$54    ;0 10 101 00 ;$54-  recv irq, RTS HIGH no xmit irq,  8N1,  DIVIDE BY 1,
+  398  061C  85 69             STA DRVACIA     
+  399  061E  8D 10 C0          STA DDACIA      ; SET DISK SERIAL WORD FORMAT/CLEAR FLAGS
+  400  0621  20 B9 0F          JSR PRINT
+  401  0624  0D 0A 48          .BYTE $D,$A,'Head unloaded ',0
+       0627  65 61 64  
+       062A  20 75 6E  
+       062D  6C 6F 61  
+       0630  64 65 64  
+       0633  20 00     
+  402  0635  20 A5 06          JSR RPMTST2
+  403  0638  AD 02 C0          LDA DDPIA+2     ; PRESERVE DISK SEL BIT
+  404  063B  29 7F             AND #$7F        ; 0111 1111
+  405  063D  8D 02 C0          STA DDPIA+2     ; LOAD DISK HEAD
+  406  0640  A2 FF             LDX #$FF        ; 320MS
+  407  0642  20 AA 0F          JSR DELAY
+  408  0645  20 B9 0F          JSR PRINT
+  409  0648  0D 0A 48          .BYTE $D,$A,'Head loaded   ',0
+       064B  65 61 64  
+       064E  20 6C 6F  
+       0651  61 64 65  
+       0654  64 20 20  
+       0657  20 00     
+  410  0659  20 A5 06          JSR RPMTST2
+  411  065C            RPMUNLOAD
+  412  065C  AD 02 C0          LDA DDPIA+2
+  413  065F  09 80             ORA #$80        
+  414  0661  8D 02 C0          STA     DDPIA+2 ; UNLOAD DISK HEAD
+  415  0664  4C 98 03          JMP TOP
+  416  0667            INDEXACT
+  417  0667  20 B9 0F          JSR PRINT
+  418  066A  49 6E 64          .BYTE 'Index stuck active',CR,LF,0
+       066D  65 78 20  
+       0670  73 74 75  
+       0673  63 6B 20  
+       0676  61 63 74  
+       0679  69 76 65  
+       067C  0D 0A 00  
+  419  067F  20 14 10          JSR ANYKEY
+  420  0682  4C 5C 06          JMP RPMUNLOAD
+  421  0685            INDEXINACT
+  422  0685  20 B9 0F          JSR PRINT
+  423  0688  49 6E 64          .BYTE 'Index stuck inactive',CR,LF,0
+       068B  65 78 20  
+       068E  73 74 75  
+       0691  63 6B 20  
+       0694  69 6E 61  
+       0697  63 74 69  
+       069A  76 65 0D  
+       069D  0A 00     
+  424  069F  20 14 10          JSR ANYKEY
+  425  06A2  4C 5C 06          JMP RPMUNLOAD
+  426  06A5            RPMTST2
+  427  06A5  A2 00             LDX #0
+  428  06A7  A0 00             LDY #0
+  429  06A9            RPMTSTLP
+  430  06A9  E8                INX
+  431  06AA  D0 01             BNE *+3
+  432  06AC  C8                INY
+  433  06AD  F0 B8             BEQ INDEXACT
+  434  06AF  2C 00 C0          BIT DDPIA       ; WAIT END OF
+  435  06B2  10 F5             BPL RPMTSTLP    ; INDEX PULSE
+  436  06B4  A9 00             LDA #0
+  437  06B6  85 46             STA DIVISOR     ; Clear variables
+  438  06B8  85 47             STA DIVISOR+1
+  439  06BA  85 48             STA DIVISOR+2
+  440  06BC  85 50             STA MAX
+  441  06BE  85 51             STA MAX+1
+  442  06C0  85 52             STA MAX+2
+  443  06C2  85 56             STA SUM
+  444  06C4  85 57             STA SUM+1
+  445  06C6  85 58             STA SUM+2
+  446  06C8  A9 FF             LDA #255
+  447  06CA  85 53             STA MIN
+  448  06CC  85 54             STA MIN+1
+  449  06CE  85 55             STA MIN+2
+  450  06D0  A2 10             LDX #16         ; Measure RPM 16 times
+  451  06D2  A0 00             LDY #0
+  452  06D4  A9 00             LDA #0
+  453  06D6  18                CLC
+  454  06D7            RPMLP1
+  455                          ; Wait for index then write first byte to UART since it
+  456                          ; should be ready. Then write a second byte since it should either
+  457                          ; be ready immediatly or very shortly after first byte is transferred
+  458                          ; to TX shift register. Then start counting with the writes that
+  459                          ; will happen at the UART data rate.
+  460  06D7  C8                INY
+  461  06D8  D0 02             BNE *+4
+  462  06DA  69 01             ADC #1
+  463  06DC  F0 A7             BEQ INDEXINACT  ; If we wait to long for index inactive print error
+  464  06DE  2C 00 C0          BIT DDPIA       ; WAIT for INDEX PULSE
+  465  06E1  30 F4             BMI RPMLP1
+  466  06E3  8D 11 C0          STA DDACIA+1    ; WRITE BYTE, VALUE DON'T CARE
+  467  06E6            RPMNDX0
+  468  06E6  A9 02             LDA #2
+  469  06E8  2D 10 C0          AND DDACIA      ;test tx ready? 
+  470  06EB  F0 F9             BEQ RPMNDX0     ;not ready?
+  471  06ED  8D 11 C0          STA DDACIA+1    ; WRITE BYTE, VALUE DON'T CARE
+  472  06F0            RPMNDX1
+  473  06F0  A9 02             LDA #2
+  474  06F2  2D 10 C0          AND DDACIA      ;test tx ready? 
+  475  06F5  F0 F9             BEQ RPMNDX1     ;not ready?
+  476  06F7  8D 11 C0          STA DDACIA+1    ; WRITE BYTE, VALUE DON'T CARE
+  477  06FA  E6 46             INC DIVISOR
+  478  06FC  D0 02             BNE *+4
+  479  06FE  E6 47             INC DIVISOR+1
+  480  0700  D0 02             BNE *+4
+  481  0702  E6 48             INC DIVISOR+2
+  482  0704  2C 00 C0          BIT DDPIA       ; WAIT END OF
+  483  0707  10 E7             BPL RPMNDX1     ; INDEX PULSE
+  484  0709            RPMNDX2
+  485  0709  2C 00 C0          BIT DDPIA       ; DONE IF 
+  486  070C  10 17             BPL RPMNDX3     ; INDEX PULSE
+  487  070E  A9 02             LDA #2
+  488  0710  2D 10 C0          AND DDACIA      ;test tx ready? 
+  489  0713  F0 F4             BEQ RPMNDX2     ;not ready?
+  490  0715  8D 11 C0          STA DDACIA+1    ; WRITE BYTE, VALUE DON'T CARE
+  491  0718  E6 46             INC DIVISOR     ; Count character sent
+  492  071A  D0 02             BNE *+4
+  493  071C  E6 47             INC DIVISOR+1
+  494  071E  D0 02             BNE *+4
+  495  0720  E6 48             INC DIVISOR+2
+  496  0722  4C 09 07          JMP RPMNDX2
+  497  0725            RPMNDX3
+  498  0725  2C 00 C0          BIT DDPIA       ; WAIT END OF
+  499  0728  10 FB             BPL RPMNDX3     ; INDEX PULSE
+  500  072A  18                CLC
+  501  072B  A5 56             LDA SUM         ; Sum of all rotation time
+  502  072D  65 46             ADC DIVISOR
+  503  072F  85 56             STA SUM
+  504  0731  A5 57             LDA SUM+1
+  505  0733  65 47             ADC DIVISOR+1
+  506  0735  85 57             STA SUM+1
+  507  0737  A5 58             LDA SUM+2
+  508  0739  65 48             ADC DIVISOR+2
+  509  073B  85 58             STA SUM+2
+  510                  
+  511  073D  A5 48             LDA DIVISOR+2
+  512  073F  C5 55             CMP MIN+2
+  513  0741  90 35             BCC LESS1
+  514  0743  D0 0E             BNE GE1
+  515  0745  A5 47             LDA DIVISOR+1
+  516  0747  C5 54             CMP MIN+1
+  517  0749  90 2D             BCC LESS1
+  518  074B  D0 06             BNE GE1
+  519  074D  A5 46             LDA DIVISOR
+  520  074F  C5 53             CMP MIN
+  521  0751  90 25             BCC LESS1
+  522  0753            GE1     ; DIVISOR >= MIN
+  523  0753  A5 48             LDA DIVISOR+2
+  524  0755  C5 52             CMP MAX+2
+  525  0757  90 2E             BCC LESS2
+  526  0759  D0 0E             BNE GE2
+  527  075B  A5 47             LDA DIVISOR+1
+  528  075D  C5 51             CMP MAX+1
+  529  075F  90 26             BCC LESS2
+  530  0761  D0 06             BNE GE2
+  531  0763  A5 46             LDA DIVISOR
+  532  0765  C5 50             CMP MAX
+  533  0767  90 1E             BCC LESS2
+  534  0769            GE2     ; DIVISOR >= MAX
+  535  0769  A5 46             LDA DIVISOR
+  536  076B  85 50             STA MAX
+  537  076D  A5 47             LDA DIVISOR+1
+  538  076F  85 51             STA MAX+1
+  539  0771  A5 48             LDA DIVISOR+2
+  540  0773  85 52             STA MAX+2
+  541  0775  4C 87 07          JMP LESS2
+  542                  
+  543  0778            LESS1   ; DIVISOR < MIN
+  544  0778  A5 46             LDA DIVISOR
+  545  077A  85 53             STA MIN
+  546  077C  A5 47             LDA DIVISOR+1
+  547  077E  85 54             STA MIN+1
+  548  0780  A5 48             LDA DIVISOR+2
+  549  0782  85 55             STA MIN+2
+  550  0784  4C 53 07          JMP GE1
+  551                          
+  552  0787            LESS2   ; DIVISOR < MAX
+  553  0787  CA                DEX
+  554  0788  F0 0B             BEQ RPMDONE
+  555  078A  A9 00             LDA #0
+  556  078C  85 46             STA DIVISOR
+  557  078E  85 47             STA DIVISOR+1
+  558  0790  85 48             STA DIVISOR+2
+  559  0792  4C D7 06          JMP RPMLP1
+  560                  
+  561  0795            RPMDONE
+  562  0795  20 B9 0F          JSR PRINT
+  563  0798  52 50 4D          .BYTE 'RPM: AVG ',0
+       079B  3A 20 41  
+       079E  56 47 20  
+       07A1  00        
+  564  07A2  A2 04             LDX #4          ; Divide by 16 to convert sum to average
+  565  07A4            RPMDIVL
+  566  07A4  18                CLC
+  567  07A5  66 58             ROR SUM+2
+  568  07A7  66 57             ROR SUM+1
+  569  07A9  66 56             ROR SUM
+  570  07AB  CA                DEX
+  571  07AC  D0 F6             BNE RPMDIVL
+  572  07AE  A5 56             LDA SUM
+  573  07B0  85 46             STA DIVISOR
+  574  07B2  A5 57             LDA SUM+1
+  575  07B4  85 47             STA DIVISOR+1
+  576  07B6  A5 58             LDA SUM+2
+  577  07B8  85 48             STA DIVISOR+2
+  578  07BA  20 EE 07          JSR RPMPRT
+  579                  
+  580  07BD  20 B9 0F          JSR PRINT
+  581  07C0  20 20 4D          .BYTE '  MIN',0
+       07C3  49 4E 00  
+  582                  
+  583  07C6  A5 50             LDA MAX
+  584  07C8  85 46             STA DIVISOR
+  585  07CA  A5 51             LDA MAX+1
+  586  07CC  85 47             STA DIVISOR+1
+  587  07CE  A5 52             LDA MAX+2
+  588  07D0  85 48             STA DIVISOR+2
+  589  07D2  20 EE 07          JSR RPMPRT
+  590                  
+  591  07D5  20 B9 0F          JSR PRINT
+  592  07D8  20 20 4D          .BYTE '  MAX',0
+       07DB  41 58 00  
+  593                  
+  594  07DE  A5 53             LDA MIN
+  595  07E0  85 46             STA DIVISOR
+  596  07E2  A5 54             LDA MIN+1
+  597  07E4  85 47             STA DIVISOR+1
+  598  07E6  A5 55             LDA MIN+2
+  599  07E8  85 48             STA DIVISOR+2
+  600  07EA  20 EE 07          JSR RPMPRT
+  601  07ED  60                RTS
+  602                  
+  603                          ; Convert count to RPM with two decimal places
+  604  07EE            RPMPRT
+  605  07EE  A5 2B             LDA MAXPAG
+  606  07F0  C9 0F             CMP #MAXPAG8
+  607  07F2  F0 0F             BEQ RPM8
+  608  07F4  A5 60             LDA RPMSCALE5
+  609  07F6  85 43             STA DIVIDEND
+  610  07F8  A5 61             LDA RPMSCALE5+1
+  611  07FA  85 44             STA DIVIDEND+1
+  612  07FC  A5 62             LDA RPMSCALE5+2
+  613  07FE  85 45             STA DIVIDEND+2
+  614  0800  4C 0F 08          JMP DODIV
+  615  0803            RPM8
+  616  0803  A5 5D             LDA RPMSCALE8
+  617  0805  85 43             STA DIVIDEND
+  618  0807  A5 5E             LDA RPMSCALE8+1
+  619  0809  85 44             STA DIVIDEND+1
+  620  080B  A5 5F             LDA RPMSCALE8+2
+  621  080D  85 45             STA DIVIDEND+2
+  622  080F            DODIV
+  623  080F  20 A9 12          JSR DIV24       ; Get integer part of RPM
+  624  0812  A9 20             LDA #' '
+  625  0814  85 59             STA pad
+  626  0816  20 54 08          JSR PrDec16
+  627  0819  A9 64             LDA #100        ; Multiply remainder by 100 and divide again to get
+  628  081B  85 4C             STA factor2     ; fractional part
+  629  081D  A9 00             LDA #0
+  630  081F  85 4D             STA factor2+1
+  631  0821  85 4E             STA factor2+2
+  632  0823  20 DF 12          JSR MULT24
+  633  0826  20 A9 12          JSR DIV24
+  634  0829  A9 2E             LDA #'.'
+  635  082B  20 30 12          JSR OUTPUT
+  636  082E  A9 30             LDA #'0'
+  637  0830  85 59             STA pad
+  638  0832  A0 02             LDY #2                       ; Print 2 digits
+  639  0834  20 56 08          JSR PrDec16Lp1
+  640  0837  60                RTS
+  641                          
+  642                     ; From http://beebwiki.mdfs.net/Number_output_in_6502_machine_code
+  643                     ; ---------------------------
+  644                     ; Print 16-bit decimal number
+  645                     ; ---------------------------
+  646                     ; On entry, num=number to print
+  647                     ;           pad=0 or pad character (eg '0' or ' ')
+  648                     ; On entry at PrDec16Lp1,
+  649                     ;           Y=(number of digits)*2-2, eg 8 for 5 digits
+  650                     ; On exit,  A,X,Y,num,pad corrupted
+  651                     ; Size      69 bytes
+  652                     ; -----------------------------------------------------------------
+  653  0043            num = DIVIDEND
+  654                  
+  655  0838            PrDec2Dig
+  656  0838  85 43        STA num
+  657  083A  A9 00        LDA #0
+  658  083C  85 44        STA num+1
+  659  083E  A9 20        LDA #' '
+  660  0840  85 59        STA pad
+  661  0842  A0 02        LDY #2
+  662  0844  4C 56 08     JMP PrDec16Lp1
+  663  0847            PrDec4Dig
+  664  0847  86 43        STX num
+  665  0849  85 44        STA num+1
+  666  084B  A9 20        LDA #' '
+  667  084D  85 59        STA pad
+  668  084F  A0 06        LDY #6
+  669  0851  4C 56 08     JMP PrDec16Lp1
+  670                  
+  671  0854            PrDec16
+  672  0854  A0 08        LDY #8               ; Offset to powers of ten
+  673  0856            PrDec16Lp1
+  674  0856  A2 FF        LDX #$FF
+  675  0858  38           SEC                  ; Start with digit=-1
+  676  0859            PrDec16Lp2
+  677  0859  A5 43        LDA num+0
+  678  085B  F9 94 08     SBC PrDec16Tens+0,Y
+  679  085E  85 43        STA num+0            ; Subtract current tens
+  680  0860  A5 44        LDA num+1
+  681  0862  F9 95 08     SBC PrDec16Tens+1,Y
+  682  0865  85 44        STA num+1
+  683  0867  E8           INX
+  684  0868  B0 EF        BCS PrDec16Lp2       ; Loop until <0
+  685  086A  A5 43        LDA num+0
+  686  086C  79 94 08     ADC PrDec16Tens+0,Y
+  687  086F  85 43        STA num+0            ; Add current tens back in
+  688  0871  A5 44        LDA num+1
+  689  0873  79 95 08     ADC PrDec16Tens+1,Y
+  690  0876  85 44        STA num+1
+  691  0878  8A           TXA
+  692  0879  C0 00        CPY #0
+  693  087B  F0 09        BEQ PrDec16Digit     ; Last digit, always print
+  694  087D  8A           TXA
+  695  087E  D0 06        BNE PrDec16Digit     ; Not zero, print it
+  696  0880  A5 59        LDA pad
+  697  0882  D0 08        BNE PrDec16Print
+  698  0884  F0 09        BEQ PrDec16Next      ; pad<>0, use it
+  699  0886            PrDec16Digit
+  700  0886  A2 30        LDX #'0
+  701  0888  86 59        STX pad              ; No more zero padding
+  702  088A  09 30        ORA #'0              ; Print this digit
+  703  088C            PrDec16Print
+  704  088C  20 30 12     JSR OUTPUT
+  705  088F            PrDec16Next
+  706  088F  88           DEY
+  707  0890  88           DEY
+  708  0891  10 C3        BPL PrDec16Lp1       ; Loop for next digit
+  709  0893  60           RTS
+  710  0894            PrDec16Tens
+  711  0894  01 00        .WORD 1
+  712  0896  0A 00        .WORD 10
+  713  0898  64 00        .WORD 100
+  714  089A  E8 03        .WORD 1000
+  715  089C  10 27        .WORD 10000
+  716                  ;-----------------------------------------------------------
+  717                  ; Either write test pattern then check or just check pattern.
+  718                  ; Read test only works for data written by this program.
+  719  089E            TEST
+  720  089E  A9 00             LDA     #0
+  721  08A0  85 76             STA     SINGLETRK
+  722  08A2            TEST2
+  723  08A2  20 B9 0F          JSR     PRINT
+  724  08A5  0D 0A             .BYTE   CR,LF
+  725  08A7  57 52 49          .BYTE   'WRITE PROTECT ALL DISKS EXCEPT TEST DISK!',CR,LF
+       08AA  54 45 20  
+       08AD  50 52 4F  
+       08B0  54 45 43  
+       08B3  54 20 41  
+       08B6  4C 4C 20  
+       08B9  44 49 53  
+       08BC  4B 53 20  
+       08BF  45 58 43  
+       08C2  45 50 54  
+       08C5  20 54 45  
+       08C8  53 54 20  
+       08CB  44 49 53  
+       08CE  4B 21 0D  
+       08D1  0A        
+  726  08D2  0D 0A             .BYTE   CR,LF
+  727  08D4  49 4E 53          .BYTE   'INSERT DISK TO BE TESTED',CR,LF
+       08D7  45 52 54  
+       08DA  20 44 49  
+       08DD  53 4B 20  
+       08E0  54 4F 20  
+       08E3  42 45 20  
+       08E6  54 45 53  
+       08E9  54 45 44  
+       08EC  0D 0A     
+  728  08EE  49 66 20          .BYTE   'If errors found the output is DDDD (#### GG BBP)* EEEE',CR,LF
+       08F1  65 72 72  
+       08F4  6F 72 73  
+       08F7  20 66 6F  
+       08FA  75 6E 64  
+       08FD  20 74 68  
+       0900  65 20 6F  
+       0903  75 74 70  
+       0906  75 74 20  
+       0909  69 73 20  
+       090C  44 44 44  
+       090F  44 20 28  
+       0912  23 23 23  
+       0915  23 20 47  
+       0918  47 20 42  
+       091B  42 50 29  
+       091E  2A 20 45  
+       0921  45 45 45  
+       0924  0D 0A     
+  729  0926  77 68 65          .BYTE   'where DDDD is difference between number of bytes written',CR,LF
+       0929  72 65 20  
+       092C  44 44 44  
+       092F  44 20 69  
+       0932  73 20 64  
+       0935  69 66 66  
+       0938  65 72 65  
+       093B  6E 63 65  
+       093E  20 62 65  
+       0941  74 77 65  
+       0944  65 6E 20  
+       0947  6E 75 6D  
+       094A  62 65 72  
+       094D  20 6F 66  
+       0950  20 62 79  
+       0953  74 65 73  
+       0956  20 77 72  
+       0959  69 74 74  
+       095C  65 6E 0D  
+       095F  0A        
+  730  0960  61 6E 64          .BYTE   'and read. EEEE is total errors, #### is byte count from', CR,LF
+       0963  20 72 65  
+       0966  61 64 2E  
+       0969  20 45 45  
+       096C  45 45 20  
+       096F  69 73 20  
+       0972  74 6F 74  
+       0975  61 6C 20  
+       0978  65 72 72  
+       097B  6F 72 73  
+       097E  2C 20 23  
+       0981  23 23 23  
+       0984  20 69 73  
+       0987  20 62 79  
+       098A  74 65 20  
+       098D  63 6F 75  
+       0990  6E 74 20  
+       0993  66 72 6F  
+       0996  6D 0D 0A  
+  731  0999  73 74 61          .BYTE   'start of track, GG is good byte, BB is bad byte,',CR,LF
+       099C  72 74 20  
+       099F  6F 66 20  
+       09A2  74 72 61  
+       09A5  63 6B 2C  
+       09A8  20 47 47  
+       09AB  20 69 73  
+       09AE  20 67 6F  
+       09B1  6F 64 20  
+       09B4  62 79 74  
+       09B7  65 2C 20  
+       09BA  42 42 20  
+       09BD  69 73 20  
+       09C0  62 61 64  
+       09C3  20 62 79  
+       09C6  74 65 2C  
+       09C9  0D 0A     
+  732  09CB  50 20 69          .BYTE   'P is byte had parity error.',CR,LF
+       09CE  73 20 62  
+       09D1  79 74 65  
+       09D4  20 68 61  
+       09D7  64 20 70  
+       09DA  61 72 69  
+       09DD  74 79 20  
+       09E0  65 72 72  
+       09E3  6F 72 2E  
+       09E6  0D 0A     
+  733  09E8  45 72 72          .BYTE   'Errors that fit on line are printed.',CR,LF
+       09EB  6F 72 73  
+       09EE  20 74 68  
+       09F1  61 74 20  
+       09F4  66 69 74  
+       09F7  20 6F 6E  
+       09FA  20 6C 69  
+       09FD  6E 65 20  
+       0A00  61 72 65  
+       0A03  20 70 72  
+       0A06  69 6E 74  
+       0A09  65 64 2E  
+       0A0C  0D 0A     
+  734  0A0E  45 53 43          .BYTE   'ESC KEY OR ^X ABORTS...',CR,LF,0
+       0A11  20 4B 45  
+       0A14  59 20 4F  
+       0A17  52 20 5E  
+       0A1A  58 20 41  
+       0A1D  42 4F 52  
+       0A20  54 53 2E  
+       0A23  2E 2E 0D  
+       0A26  0A 00     
+  735                  
+  736  0A28  20 14 10          JSR     ANYKEY
+  737  0A2B  C9 1B             CMP     #$1B   ;ESC key?
+  738  0A2D  F0 3B             BEQ     JMP2TOP
+  739  0A2F  C9 18             CMP     #$18   ;^X
+  740  0A31  F0 37             BEQ     JMP2TOP
+  741                  
+  742                  
+  743  0A33  A5 34             LDA     PASSES
+  744  0A35  85 36             STA     PASSCNTR
+  745  0A37  20 D6 0E          JSR     INITPIA
+  746  0A3A  20 F6 0E          JSR     SELDRV
+  747  0A3D  20 C5 0E          JSR     RESPTR
+  748  0A40  A9 20             LDA     #$20
+  749  0A42  2C 00 C0          BIT     DDPIA
+  750  0A45  D0 26             BNE     WRITEOK
+  751  0A47  20 B9 0F          JSR     PRINT
+  752  0A4A  0D 0A             .BYTE   CR,LF
+  753  0A4C  44 49 53          .BYTE   'DISK IS WRITE PROTECTED!',CR,LF,0
+       0A4F  4B 20 49  
+       0A52  53 20 57  
+       0A55  52 49 54  
+       0A58  45 20 50  
+       0A5B  52 4F 54  
+       0A5E  45 43 54  
+       0A61  45 44 21  
+       0A64  0D 0A 00  
+  754  0A67  20 14 10          JSR     ANYKEY
+  755  0A6A            JMP2TOP
+  756  0A6A  4C 98 03          JMP     TOP
+  757  0A6D            WRITEOK
+  758  0A6D  A5 76             LDA     SINGLETRK
+  759  0A6F  D0 08             BNE     TESTFILL ; Head already at desired track
+  760  0A71  20 13 0F          JSR     TZERO   ; STEP TO TRACK 0
+  761  0A74  90 03             BCC     TESTFILL
+  762  0A76  4C 9F 0E          JMP     NOTRK
+  763                  
+  764  0A79            TESTFILL
+  765  0A79  20 C5 0E          JSR     RESPTR
+  766  0A7C  A0 00             LDY     #0
+  767  0A7E            TFILL   
+  768  0A7E  A5 33             LDA     PATVAL
+  769  0A80  24 32             BIT     PATSEL          ; Fill with test pattern. 
+  770  0A82  10 03             BPL     TSTORE          ; Always fills larger 8" number of bytes
+  771  0A84  20 93 12          JSR     RAND
+  772  0A87            TSTORE
+  773  0A87  91 6C             STA     (TDATA),Y
+  774  0A89  C8                INY
+  775  0A8A  D0 02             BNE     TCHKFILLED
+  776  0A8C  E6 6D             INC     TDATA+1
+  777  0A8E            TCHKFILLED
+  778  0A8E  C0 10             CPY     #BYTES8%256
+  779  0A90  D0 EC             BNE     TFILL
+  780  0A92  A5 6D             LDA     TDATA+1
+  781  0A94  38                SEC
+  782  0A95  E9 14             SBC     #BUFFER/256
+  783  0A97  C9 0E             CMP     #BYTES8/256
+  784  0A99  D0 E3             BNE     TFILL
+  785                  
+  786  0A9B  A9 5A             LDA     #$5A            ; Start of track marker
+  787  0A9D  8D 7F 14          STA     BUFFER
+  788                          
+  789  0AA0  A9 58             LDA     #$58    ;0 10 110 00 ;$58-  recv irq, RTS HIGH no xmit irq,  8E1,  DIVIDE BY 1,
+  790  0AA2  85 69             STA     DRVACIA 
+  791                  
+  792  0AA4  AD 02 C0          LDA     DDPIA+2  ; PRESERVE DISK SEL BIT
+  793  0AA7  29 7F             AND     #$7F    ; 0111 1111
+  794  0AA9  8D 02 C0          STA     DDPIA+2 ; LOAD DISK HEAD
+  795  0AAC  A2 FF             LDX     #$FF    ; 320MS
+  796  0AAE  20 AA 0F          JSR     DELAY
+  797                  
+  798  0AB1  A5 35             LDA     READONLY        ; If read only skip write
+  799  0AB3  F0 03             BEQ     WRNEXT
+  800  0AB5  4C 51 0B          JMP     TREAD
+  801  0AB8            WRNEXT
+  802  0AB8  20 B9 0F          JSR     PRINT
+  803  0ABB  57 54 52          .BYTE   'WTRK ',0
+       0ABE  4B 20 00  
+  804  0AC1  A5 2E             LDA     TRK
+  805  0AC3  20 38 08          JSR     PrDec2Dig
+  806  0AC6  A5 63             LDA     MTRKBYTES
+  807  0AC8  85 65             STA     BYTECNTR
+  808  0ACA  A5 64             LDA     MTRKBYTES+1
+  809  0ACC  85 66             STA     BYTECNTR+1
+  810  0ACE  20 C5 0E          JSR     RESPTR
+  811  0AD1  A5 2E             LDA     TRK     ; Write track to second byte to check for seek errors
+  812  0AD3  8D 80 14          STA     BUFFER+1
+  813                  
+  814  0AD6  2C 00 C0          BIT     DDPIA   ; WAIT 
+  815  0AD9  30 FB             BMI     *-3     ; INDEX PULSE
+  816  0ADB  2C 00 C0          BIT     DDPIA   ; WAIT END OF
+  817  0ADE  10 FB             BPL     *-3     ; INDEX PULSE
+  818  0AE0  AD 02 C0          LDA     DDPIA+2 ; PRESERVE DISK SEL BIT
+  819  0AE3  29 FC             AND     #$FC    ; TURN ON WRITE AND ERASE ENABLE
+  820  0AE5  8D 02 C0          STA     DDPIA+2
+  821                  
+  822  0AE8  A9 03             LDA     #3
+  823  0AEA  8D 10 C0          STA     DDACIA  ; RESET ACIA
+  824  0AED  A5 69             LDA     DRVACIA ; usually $58-DIVIDE BY 1, 8E1, RTS HIGH no IRQs
+  825  0AEF  8D 10 C0          STA     DDACIA  ; SET DISK SERIAL WORD FORMAT/CLEAR FLAGS
+  826  0AF2  A2 01             LDX     #1      ; 0.8MS
+  827  0AF4  A0 9E             LDY     #$9E
+  828  0AF6  20 AC 0F          JSR     DELAY1
+  829  0AF9  A0 00             LDY     #0
+  830  0AFB            WRDATALP
+  831  0AFB  2C 00 C0          BIT     DDPIA   ; WAIT 
+  832  0AFE  30 03             BMI     WNOINDEXERR     ; Didn't find INDEX PULSE
+  833  0B00  4C 51 0E          JMP     INDEXERR        
+  834  0B03            WNOINDEXERR
+  835  0B03  A9 02             LDA     #2
+  836  0B05  2D 10 C0          AND     DDACIA          ;test tx ready? 
+  837  0B08  F0 F1             BEQ     WRDATALP        ;not ready?
+  838  0B0A  B1 6C             LDA     (TDATA),Y
+  839  0B0C  8D 11 C0          STA     DDACIA+1        ; Write data to floppy
+  840  0B0F  C8                INY
+  841  0B10  D0 02             BNE     *+4
+  842  0B12  E6 6D             INC     TDATA+1
+  843  0B14  E6 65             INC     BYTECNTR
+  844  0B16  D0 E3             BNE     WRDATALP
+  845  0B18  E6 66             INC     BYTECNTR+1
+  846  0B1A  D0 E7             BNE     WNOINDEXERR     ; Not done, write more. Don't check for index
+  847                                                  ; to prevent being late writing next char.
+  848                  
+  849  0B1C  2C 00 C0          BIT     DDPIA   ; WAIT FOR
+  850  0B1F  30 FB             BMI     *-3     ; INDEX PULSE
+  851  0B21  2C 00 C0          BIT     DDPIA   ; WAIT FOR
+  852  0B24  10 FB             BPL     *-3     ; END INDEX PULSE
+  853  0B26  A2 20             LDX     #32     ; Erase a little past index
+  854  0B28  CA                DEX
+  855  0B29  D0 FD             BNE     *-1
+  856                          
+  857  0B2B  A9 03             LDA     #$03
+  858  0B2D  0D 02 C0          ORA     DDPIA+2 ; turn off write and erase
+  859  0B30  8D 02 C0          STA     DDPIA+2
+  860                  
+  861  0B33  A9 0D             LDA     #CR
+  862  0B35  20 30 12          JSR     OUTPUT
+  863  0B38  A5 76             LDA     SINGLETRK
+  864  0B3A  D0 15             BNE     TREAD   ; Single track, we are done writing
+  865  0B3C  A6 2E             LDX     TRK
+  866  0B3E  E8                INX
+  867  0B3F  E4 2A             CPX     MAXTRK
+  868  0B41  F0 06             BEQ     TWDONE
+  869  0B43  20 77 0F          JSR     TNEXT   ; Go to next track
+  870  0B46  4C B8 0A          JMP     WRNEXT
+  871  0B49            TWDONE
+  872  0B49  A9 80             LDA     #$80
+  873  0B4B  0D 02 C0          ORA     DDPIA+2 ; Unload head
+  874  0B4E  8D 02 C0          STA     DDPIA+2
+  875                  
+  876                  
+  877                          ; Read portion of disk test. Enter at TREAD2 if testing
+  878                          ; single track. For normal read we save off the data read and the
+  879                          ; error flags from the serial chip. We don't have enough time
+  880                          ; to handle errors between bytes.
+  881                          ; For scope read we check the word in real time and generate
+  882                          ; fault reset pulse to trigger a scope. Checking for the track stops
+  883                          ; after the first error.
+  884  0B51            TREAD
+  885  0B51  A5 76             LDA     SINGLETRK
+  886  0B53  D0 15             BNE     TREAD2  ; Single track, skip seek to zero
+  887  0B55  20 13 0F          JSR     TZERO   ; STEP TO TRACK 0
+  888  0B58  90 03             BCC     *+5
+  889  0B5A  4C 9F 0E          JMP     NOTRK
+  890  0B5D  AD 02 C0          LDA     DDPIA+2  ; PRESERVE DISK SEL BIT
+  891  0B60  29 7F             AND     #$7F    ; 0111 1111
+  892  0B62  8D 02 C0          STA     DDPIA+2 ; LOAD DISK HEAD
+  893  0B65  A2 FF             LDX     #$FF    ; 320MS
+  894  0B67  20 AA 0F          JSR     DELAY
+  895                  
+  896  0B6A            TREAD2
+  897  0B6A  20 C5 0E          JSR     RESPTR
+  898  0B6D  A9 00             LDA     #0
+  899  0B6F  85 5A             STA     ERRCNT
+  900  0B71  85 5B             STA     ERRCNT+1
+  901  0B73  85 5C             STA     PRTERR  
+  902                  
+  903  0B75  20 B9 0F          JSR     PRINT
+  904  0B78  52 54 52          .BYTE   'RTRK ',0
+       0B7B  4B 20 00  
+  905  0B7E  A5 2E             LDA     TRK
+  906  0B80  20 38 08          JSR     PrDec2Dig
+  907  0B83  A9 20             LDA     #' '
+  908  0B85  20 30 12          JSR     OUTPUT
+  909  0B88  A5 2E             LDA     TRK             ; Update compare data with track testing
+  910  0B8A  8D 80 14          STA     BUFFER+1
+  911                  
+  912  0B8D  2C 00 C0          BIT     DDPIA   ; WAIT 
+  913  0B90  30 FB             BMI     *-3     ; INDEX PULSE
+  914  0B92  2C 00 C0          BIT     DDPIA   ; WAIT END OF
+  915  0B95  10 FB             BPL     *-3     ; INDEX PULSE
+  916  0B97  A9 03             LDA     #3
+  917  0B99  8D 10 C0          STA     DDACIA  ; RESET ACIA
+  918  0B9C  A5 69             LDA     DRVACIA ; usually $58-DIVIDE BY 1, 8E1, RTS HIGH no IRQs
+  919  0B9E  8D 10 C0          STA     DDACIA  ; SET DISK SERIAL WORD FORMAT/CLEAR FLAGS
+  920  0BA1  A5 68             LDA     TESTTYPE
+  921  0BA3  D0 03             BNE     *+5
+  922  0BA5  4C D1 0C          JMP     NORMREAD        ; User selected normal read test
+  923                  
+  924                          ; This is scope read check code
+  925  0BA8  A0 00             LDY     #0
+  926  0BAA  A9 01             LDA     #1
+  927  0BAC            RDATALP2
+  928  0BAC  2C 00 C0          BIT     DDPIA
+  929  0BAF  10 35             BPL     NODATA          ; INDEX PULSE
+  930  0BB1  2C 10 C0          BIT     DDACIA          ; test tx ready?        
+  931  0BB4  F0 F6             BEQ     RDATALP2
+  932  0BB6  08                PHP
+  933  0BB7  AD 11 C0          LDA     DDACIA+1        ; read data from floppy
+  934  0BBA  C9 5A             CMP     #$5A            ; Got start byte
+  935  0BBC  D0 07             BNE     IGNBYTE         ; No, try one more time. We get one junk
+  936                                                  ; byte where write turned on/off
+  937  0BBE  28                PLP
+  938  0BBF  70 33             BVS     SERROR          ; Did it get a parity error
+  939  0BC1  C8                INY                     ; Skip this byte in checking since we checked
+  940  0BC2  4C C6 0B          JMP     RDATALP3
+  941  0BC5            IGNBYTE
+  942  0BC5  28                PLP
+  943  0BC6            RDATALP3
+  944  0BC6  2C 00 C0          BIT     DDPIA
+  945  0BC9  30 03             BMI     NOTINDEX2       ; INDEX PULSE
+  946  0BCB  4C D6 0D          JMP     PCRONLY
+  947  0BCE            NOTINDEX2
+  948  0BCE  A9 01             LDA     #1
+  949  0BD0  2C 10 C0          BIT     DDACIA          ; test tx ready?        
+  950  0BD3  F0 F1             BEQ     RDATALP3
+  951  0BD5  AD 11 C0          LDA     DDACIA+1        ; read data from floppy
+  952  0BD8  70 1A             BVS     SERROR          ; Branch if parity error
+  953  0BDA  D1 6C             CMP     (TDATA),Y       ; Check data
+  954  0BDC  D0 16             BNE     SERROR
+  955  0BDE  C8                INY
+  956  0BDF  D0 ED             BNE     NOTINDEX2
+  957  0BE1  E6 6D             INC     TDATA+1
+  958  0BE3  4C CE 0B          JMP     NOTINDEX2
+  959  0BE6            NODATA
+  960  0BE6  20 B9 0F          JSR     PRINT
+  961  0BE9  4E 6F 20          .BYTE   'No data',0
+       0BEC  64 61 74  
+       0BEF  61 00     
+  962  0BF1            JPCRLF
+  963  0BF1  4C CD 0D          JMP     PCRLF
+  964  0BF4            SERROR  ; Print error info and generate scope trigger
+  965  0BF4  48                PHA
+  966  0BF5  A9 EF             LDA     #$EF
+  967  0BF7  2D 02 C0          AND     DDPIA+2 ; Clear fault reset
+  968  0BFA  8D 02 C0          STA     DDPIA+2
+  969  0BFD  20 B5 0F          JSR     DELAY2
+  970  0C00  A9 10             LDA     #$10
+  971  0C02  0D 02 C0          ORA     DDPIA+2 ; Set fault reset
+  972  0C05  8D 02 C0          STA     DDPIA+2
+  973                  
+  974  0C08  38                SEC
+  975  0C09  A5 6D             LDA     TDATA+1         ; Calculate offset of byte with error
+  976  0C0B  E9 14             SBC     #>BUFFER
+  977  0C0D  85 44             STA     num+1
+  978  0C0F  84 67             STY     YHOLD
+  979  0C11  84 43             STY     num
+  980  0C13  98                TYA
+  981  0C14  18                CLC
+  982  0C15  65 63             ADC     MTRKBYTES
+  983  0C17  A5 44             LDA     num+1
+  984  0C19  65 64             ADC     MTRKBYTES+1
+  985  0C1B  30 16             BMI     SPERR   ; Error was in bytes being tested
+  986  0C1D  20 B9 0F          JSR     PRINT
+  987  0C20  45 78 74          .BYTE   'Extra data read',0
+       0C23  72 61 20  
+       0C26  64 61 74  
+       0C29  61 20 72  
+       0C2C  65 61 64  
+       0C2F  00        
+  988  0C30  4C 5A 0C          JMP     SERRWAIT
+  989                          
+  990  0C33            SPERR
+  991  0C33  A9 30             LDA     #'0'
+  992  0C35  85 59             STA     pad
+  993  0C37  A0 06             LDY     #6      ; 4 digits max
+  994  0C39  20 56 08          JSR     PrDec16Lp1
+  995  0C3C  20 B9 0F          JSR     PRINT
+  996  0C3F  20 47 4F          .BYTE   ' GOOD ',0
+       0C42  4F 44 20  
+       0C45  00        
+  997  0C46  A4 67             LDY     YHOLD
+  998  0C48  B1 6C             LDA     (TDATA),Y
+  999  0C4A  20 E3 0F          JSR     PHEXA
+ 1000  0C4D  20 B9 0F          JSR     PRINT
+ 1001  0C50  20 42 41          .BYTE   ' BAD ',0
+       0C53  44 20 00  
+ 1002  0C56  68                PLA
+ 1003  0C57  20 E3 0F          JSR     PHEXA
+ 1004  0C5A            SERRWAIT
+ 1005  0C5A  AD 02 C0          LDA     DDPIA+2
+ 1006  0C5D  09 80             ORA     #$80    
+ 1007  0C5F  8D 02 C0          STA     DDPIA+2 ; UNLOAD DISK HEAD
+ 1008  0C62  20 E7 11          JSR     Get_Chr
+ 1009  0C65  20 B9 0F          JSR     PRINT
+ 1010  0C68  0D 0A 48          .BYTE   CR,LF,'Hit space to reread E to exit or other key to continue > ',0
+       0C6B  69 74 20  
+       0C6E  73 70 61  
+       0C71  63 65 20  
+       0C74  74 6F 20  
+       0C77  72 65 72  
+       0C7A  65 61 64  
+       0C7D  20 45 20  
+       0C80  74 6F 20  
+       0C83  65 78 69  
+       0C86  74 20 6F  
+       0C89  72 20 6F  
+       0C8C  74 68 65  
+       0C8F  72 20 6B  
+       0C92  65 79 20  
+       0C95  74 6F 20  
+       0C98  63 6F 6E  
+       0C9B  74 69 6E  
+       0C9E  75 65 20  
+       0CA1  3E 20 00  
+ 1011  0CA4  20 FF 11          JSR     INKEY
+ 1012  0CA7  48                PHA
+ 1013  0CA8  20 B9 0F          JSR     PRINT
+ 1014  0CAB  0D 0A 00          .BYTE   CR,LF,0
+ 1015  0CAE  68                PLA
+ 1016  0CAF  09 20             ORA     #$20    ; Lower case
+ 1017  0CB1  C9 65             CMP     #'e'
+ 1018  0CB3  D0 03             BNE     *+5
+ 1019  0CB5  4C 98 03          JMP     TOP
+ 1020  0CB8  48                PHA
+ 1021  0CB9  AD 02 C0          LDA     DDPIA+2  ; PRESERVE DISK SEL BIT
+ 1022  0CBC  29 7F             AND     #$7F    ; 0111 1111
+ 1023  0CBE  8D 02 C0          STA     DDPIA+2 ; LOAD DISK HEAD
+ 1024  0CC1  A2 FF             LDX     #$FF    ; 320MS
+ 1025  0CC3  20 AA 0F          JSR     DELAY
+ 1026  0CC6  68                PLA
+ 1027  0CC7  C9 20             CMP     #' '
+ 1028  0CC9  F0 03             BEQ     *+5
+ 1029  0CCB  4C DB 0D          JMP     NEXTTRK
+ 1030  0CCE  4C 6A 0B          JMP     TREAD2
+ 1031                          
+ 1032                          
+ 1033                  
+ 1034                          ; This is normal read check code
+ 1035  0CD1            NORMREAD
+ 1036  0CD1  A0 00             LDY     #0
+ 1037  0CD3            RDATALP
+ 1038  0CD3  2C 00 C0          BIT     DDPIA
+ 1039  0CD6  10 16             BPL     RINDEX  ; INDEX PULSE
+ 1040  0CD8            NOTINDEX
+ 1041  0CD8  AD 10 C0          LDA     DDACIA          ; test tx ready?        
+ 1042  0CDB  91 6E             STA     (TDATA2),Y      ; store error data
+ 1043  0CDD  4A                LSR
+ 1044  0CDE  90 F3             BCC     RDATALP         ; not ready?
+ 1045  0CE0  AD 11 C0          LDA     DDACIA+1        ; read data from floppy
+ 1046  0CE3  C8                INY
+ 1047  0CE4  91 6E             STA     (TDATA2),Y      ; store disk data
+ 1048  0CE6  C8                INY
+ 1049  0CE7  D0 EF             BNE     NOTINDEX
+ 1050  0CE9  E6 6F             INC     TDATA2+1
+ 1051  0CEB  4C D8 0C          JMP     NOTINDEX
+ 1052                  
+ 1053  0CEE            RINDEX
+ 1054  0CEE  18                CLC     ; Found index, determine how many bytes read
+ 1055  0CEF  98                TYA
+ 1056  0CF0  65 6E             ADC     TDATA2
+ 1057  0CF2  85 6E             STA     TDATA2
+ 1058  0CF4  90 02             BCC     *+4
+ 1059  0CF6  E6 6F             INC     TDATA2+1
+ 1060  0CF8  38                SEC
+ 1061  0CF9  A5 6E             LDA     TDATA2
+ 1062  0CFB  E9 8F             SBC     #<BUFFER2
+ 1063  0CFD  85 65             STA     BYTECNTR
+ 1064  0CFF  A5 6F             LDA     TDATA2+1
+ 1065  0D01  E9 22             SBC     #>BUFFER2
+ 1066  0D03  18                CLC
+ 1067  0D04  6A                ROR
+ 1068  0D05  85 66             STA     BYTECNTR+1
+ 1069  0D07  A5 65             LDA     BYTECNTR        ; divide by 2 to get bytes data stored
+ 1070  0D09  6A                ROR
+ 1071  0D0A  85 65             STA     BYTECNTR
+ 1072  0D0C  A5 65             LDA     BYTECNTR
+ 1073  0D0E  D0 04             BNE     CHKSTART
+ 1074  0D10  A5 66             LDA     BYTECNTR+1
+ 1075  0D12  F0 26             BEQ     NOSKIP          ; If no data don't try to find start of track
+ 1076  0D14            CHKSTART
+ 1077                          ; This will skip up to 1 byte looking for $5A start of track flag
+ 1078                          ; The write turn on/off generates one byte of junk sometimes
+ 1079  0D14  20 C5 0E          JSR     RESPTR
+ 1080  0D17  AD 90 22          LDA     BUFFER2+1
+ 1081  0D1A  C9 5A             CMP     #$5A            ; Start of track flag
+ 1082  0D1C  F0 1C             BEQ     NOSKIP
+ 1083  0D1E  AD 92 22          LDA     BUFFER2+3
+ 1084  0D21  C9 5A             CMP     #$5A            ; Start of track flag
+ 1085  0D23  D0 15             BNE     NOSKIP          ; No, assume read error
+ 1086  0D25  18                CLC
+ 1087  0D26  A9 02             LDA     #2
+ 1088  0D28  65 6E             ADC     TDATA2
+ 1089  0D2A  85 6E             STA     TDATA2
+ 1090  0D2C  A9 00             LDA     #0
+ 1091  0D2E  65 6F             ADC     TDATA2+1        ; Ignore one junk character
+ 1092  0D30  85 6F             STA     TDATA2+1        ; and parity byte
+ 1093  0D32  A5 65             LDA     BYTECNTR
+ 1094  0D34  D0 02             BNE     *+4
+ 1095  0D36  C6 66             DEC     BYTECNTR+1
+ 1096  0D38  C6 65             DEC     BYTECNTR
+ 1097  0D3A            NOSKIP
+ 1098  0D3A  18                CLC     ; Print bytes read - bytes written. Skipped byte not
+ 1099                                  ; included in bytes read 
+ 1100  0D3B  A5 65             LDA     BYTECNTR
+ 1101  0D3D  65 63             ADC     MTRKBYTES
+ 1102  0D3F  AA                TAX
+ 1103  0D40  A5 66             LDA     BYTECNTR+1
+ 1104  0D42  65 64             ADC     MTRKBYTES+1
+ 1105  0D44  30 0D             BMI     PNEG
+ 1106  0D46  48                PHA
+ 1107  0D47  A9 20             LDA     #' '
+ 1108  0D49  20 30 12          JSR     OUTPUT
+ 1109  0D4C  68                PLA
+ 1110  0D4D  20 47 08          JSR     PrDec4Dig
+ 1111  0D50  4C 82 0D          JMP     RCHKDATA
+ 1112  0D53            PNEG
+ 1113  0D53  85 67             STA     YHOLD
+ 1114  0D55  86 2F             STX     TMP
+ 1115  0D57  A9 2D             LDA     #'-'
+ 1116  0D59  20 30 12          JSR     OUTPUT
+ 1117  0D5C  A9 00             LDA     #0
+ 1118  0D5E  38                SEC
+ 1119  0D5F  E5 2F             SBC     TMP
+ 1120  0D61  85 43             STA     num
+ 1121  0D63  A9 00             LDA     #0
+ 1122  0D65  E5 67             SBC     YHOLD
+ 1123  0D67  85 44             STA     num+1
+ 1124  0D69  A9 2D             LDA     #'-'
+ 1125  0D6B  85 59             STA     pad
+ 1126  0D6D  A0 06             LDY     #6
+ 1127  0D6F  20 56 08          JSR     PrDec16Lp1
+ 1128                  
+ 1129  0D72  38                SEC
+ 1130  0D73  A9 00             LDA     #0
+ 1131                          ; Bytes read shorted than expected so only check bytes read.
+ 1132  0D75  E5 65             SBC     BYTECNTR        
+ 1133  0D77  85 65             STA     BYTECNTR        ; Convert to negative count
+ 1134  0D79  A9 00             LDA     #0
+ 1135  0D7B  E5 66             SBC     BYTECNTR+1
+ 1136  0D7D  85 66             STA     BYTECNTR+1
+ 1137  0D7F  4C 8A 0D          JMP     RCHKDATALP
+ 1138  0D82            RCHKDATA
+ 1139  0D82  A5 63             LDA     MTRKBYTES
+ 1140  0D84  85 65             STA     BYTECNTR
+ 1141  0D86  A5 64             LDA     MTRKBYTES+1
+ 1142  0D88  85 66             STA     BYTECNTR+1
+ 1143  0D8A            RCHKDATALP
+ 1144  0D8A  A0 00             LDY     #0
+ 1145  0D8C  A9 40             LDA     #$40
+ 1146  0D8E  31 6E             AND     (TDATA2),Y
+ 1147  0D90  D0 6F             BNE     RERROR  ; Data had parity error
+ 1148  0D92  A5 6F             LDA     TDATA2+1
+ 1149  0D94  C8                INY
+ 1150  0D95  B1 6E             LDA     (TDATA2),Y
+ 1151  0D97  88                DEY
+ 1152  0D98  D1 6C             CMP     (TDATA),Y
+ 1153  0D9A  D0 65             BNE     RERROR  ; Miscompare
+ 1154  0D9C            RCONT
+ 1155  0D9C  18                CLC
+ 1156  0D9D  A9 02             LDA     #2
+ 1157  0D9F  65 6E             ADC     TDATA2  ; Inc data pointers
+ 1158  0DA1  85 6E             STA     TDATA2
+ 1159  0DA3  90 02             BCC     *+4
+ 1160  0DA5  E6 6F             INC     TDATA2+1
+ 1161  0DA7  E6 6C             INC     TDATA
+ 1162  0DA9  D0 02             BNE     *+4
+ 1163  0DAB  E6 6D             INC     TDATA+1
+ 1164  0DAD  E6 65             INC     BYTECNTR
+ 1165  0DAF  D0 02             BNE     *+4
+ 1166  0DB1  E6 66             INC     BYTECNTR+1
+ 1167  0DB3  D0 D5             BNE     RCHKDATALP
+ 1168                  
+ 1169  0DB5  A5 5A             LDA     ERRCNT  ; Done compare, did we get any errors?
+ 1170  0DB7  D0 04             BNE     PERRCNT
+ 1171  0DB9  A5 5B             LDA     ERRCNT+1
+ 1172  0DBB  F0 0C             BEQ     PNOERR  ; no
+ 1173  0DBD            PERRCNT
+ 1174  0DBD  A9 20             LDA     #' '
+ 1175  0DBF  20 30 12          JSR     OUTPUT
+ 1176  0DC2  A6 5A             LDX     ERRCNT
+ 1177  0DC4  A5 5B             LDA     ERRCNT+1
+ 1178  0DC6  20 47 08          JSR     PrDec4Dig
+ 1179  0DC9            PNOERR
+ 1180  0DC9  A5 5C             LDA     PRTERR
+ 1181  0DCB  F0 09             BEQ     PCRONLY
+ 1182  0DCD            PCRLF
+ 1183  0DCD  20 B9 0F          JSR     PRINT
+ 1184  0DD0  0D 0A 00          .BYTE   CR,LF,0
+ 1185  0DD3  4C DB 0D          JMP     NEXTTRK
+ 1186  0DD6            PCRONLY
+ 1187  0DD6  A9 0D             LDA     #CR
+ 1188  0DD8  20 30 12          JSR     OUTPUT
+ 1189  0DDB            NEXTTRK
+ 1190  0DDB  A5 76             LDA     SINGLETRK       ; Done if single track or at max
+ 1191  0DDD  D0 0D             BNE     TRDONE
+ 1192  0DDF  A6 2E             LDX     TRK
+ 1193  0DE1  E8                INX
+ 1194  0DE2  E4 2A             CPX     MAXTRK
+ 1195  0DE4  F0 06             BEQ     TRDONE
+ 1196  0DE6  20 77 0F          JSR     TNEXT   ; seek to next track
+ 1197  0DE9            JTREAD2
+ 1198  0DE9  4C 6A 0B          JMP     TREAD2
+ 1199  0DEC            TRDONE
+ 1200  0DEC  A9 80             LDA     #$80
+ 1201  0DEE  0D 02 C0          ORA     DDPIA+2 ; Unload head
+ 1202  0DF1  8D 02 C0          STA     DDPIA+2
+ 1203  0DF4  C6 36             DEC     PASSCNTR
+ 1204  0DF6  F0 03             BEQ     JMPTOP
+ 1205  0DF8  4C 6D 0A          JMP     WRITEOK
+ 1206  0DFB            JMPTOP
+ 1207  0DFB  20 14 10          JSR     ANYKEY
+ 1208  0DFE  4C 98 03          JMP     TOP
+ 1209                  
+ 1210                          ; Print offset of error and good and bad data
+ 1211  0E01            RERROR
+ 1212  0E01  E6 5A             INC     ERRCNT
+ 1213  0E03  D0 02             BNE     *+4
+ 1214  0E05  E6 5B             INC     ERRCNT+1
+ 1215  0E07  A5 5A             LDA     ERRCNT
+ 1216  0E09  C5 75             CMP     MAXERR          ; Only print first MAXERR errors
+ 1217  0E0B  B0 41             BCS     NOPRT
+ 1218  0E0D  A5 5B             LDA     ERRCNT+1
+ 1219  0E0F  D0 3D             BNE     NOPRT
+ 1220  0E11  A9 20             LDA     #' '
+ 1221  0E13  85 5C             STA     PRTERR
+ 1222  0E15  20 30 12          JSR     OUTPUT
+ 1223  0E18  38                SEC
+ 1224  0E19  A5 6C             LDA     TDATA
+ 1225  0E1B  E9 7F             SBC     #<BUFFER
+ 1226  0E1D  AA                TAX
+ 1227  0E1E  A5 6D             LDA     TDATA+1
+ 1228  0E20  E9 14             SBC     #>BUFFER        
+ 1229  0E22  20 47 08          JSR     PrDec4Dig
+ 1230  0E25  A9 20             LDA     #' '
+ 1231  0E27  20 30 12          JSR     OUTPUT
+ 1232  0E2A  A0 00             LDY     #0
+ 1233  0E2C  B1 6C             LDA     (TDATA),Y       ; Good value
+ 1234  0E2E  20 E3 0F          JSR     PHEXA
+ 1235  0E31  A9 20             LDA     #' '
+ 1236  0E33  20 30 12          JSR     OUTPUT
+ 1237  0E36  C8                INY
+ 1238  0E37  B1 6E             LDA     (TDATA2),Y      ; Bad value
+ 1239  0E39  88                DEY
+ 1240  0E3A  20 E3 0F          JSR     PHEXA
+ 1241  0E3D  A2 20             LDX     #' '
+ 1242  0E3F  A9 40             LDA     #$40
+ 1243  0E41  31 6E             AND     (TDATA2),Y
+ 1244  0E43  F0 02             BEQ     *+4
+ 1245  0E45  A2 50             LDX     #'P'            ; Parity error
+ 1246  0E47  8A                TXA
+ 1247  0E48  20 30 12          JSR     OUTPUT
+ 1248  0E4B  4C 9C 0D          JMP     RCONT
+ 1249  0E4E            NOPRT
+ 1250  0E4E  4C 9C 0D          JMP     RCONT
+ 1251                          
+ 1252  0E51            INDEXERR
+ 1253                          ; Found index before we wrote all our data
+ 1254  0E51  A9 83             LDA     #$83
+ 1255  0E53  0D 02 C0          ORA     DDPIA+2 ; Unload head, turn off write and erase
+ 1256  0E56  8D 02 C0          STA     DDPIA+2
+ 1257  0E59  20 B9 0F          JSR     PRINT
+ 1258  0E5C  0D 0A             .BYTE   CR,LF
+ 1259  0E5E  49 4E 44          .BYTE   'INDEX ACTIVE DURING WRITE, BYTES LEFT: ',0
+       0E61  45 58 20  
+       0E64  41 43 54  
+       0E67  49 56 45  
+       0E6A  20 44 55  
+       0E6D  52 49 4E  
+       0E70  47 20 57  
+       0E73  52 49 54  
+       0E76  45 2C 20  
+       0E79  42 59 54  
+       0E7C  45 53 20  
+       0E7F  4C 45 46  
+       0E82  54 3A 20  
+       0E85  00        
+ 1260  0E86  38                SEC
+ 1261  0E87  A9 00             LDA     #0
+ 1262  0E89  E5 65             SBC     BYTECNTR
+ 1263  0E8B  AA                TAX
+ 1264  0E8C  A9 00             LDA     #0
+ 1265  0E8E  E5 66             SBC     BYTECNTR+1      
+ 1266  0E90  20 FD 0F          JSR     PDEC
+ 1267  0E93  20 B9 0F          JSR     PRINT
+ 1268  0E96  0D 0A 00          .BYTE   CR,LF,0
+ 1269  0E99  20 14 10          JSR     ANYKEY
+ 1270  0E9C  4C 98 03          JMP     TOP
+ 1271                          
+ 1272  0E9F            NOTRK
+ 1273  0E9F  20 D6 0E          JSR     INITPIA
+ 1274  0EA2  20 B9 0F          JSR     PRINT
+ 1275  0EA5  0D 0A 0D          .BYTE CR,LF,CR,LF, 'ERROR Seeking Track 0',0
+       0EA8  0A 45 52  
+       0EAB  52 4F 52  
+       0EAE  20 53 65  
+       0EB1  65 6B 69  
+       0EB4  6E 67 20  
+       0EB7  54 72 61  
+       0EBA  63 6B 20  
+       0EBD  30 00     
+ 1276  0EBF  20 14 10          JSR     ANYKEY
+ 1277  0EC2  4C 98 03          JMP     TOP     
+ 1278                  
+ 1279                  ; RESET BUFFER POINTERS
+ 1280  0EC5            RESPTR  
+ 1281  0EC5  A9 7F             LDA     #<BUFFER
+ 1282  0EC7  85 6C             STA     TDATA
+ 1283  0EC9  A9 14             LDA     #>BUFFER
+ 1284  0ECB  85 6D             STA     TDATA+1
+ 1285  0ECD  A9 8F             LDA     #<BUFFER2
+ 1286  0ECF  85 6E             STA     TDATA2
+ 1287  0ED1  A9 22             LDA     #>BUFFER2
+ 1288  0ED3  85 6F             STA     TDATA2+1
+ 1289                  
+ 1290  0ED5  60                RTS
+ 1291                  
+ 1292                  ; INIT DISK CONTROLLER PIA
+ 1293  0ED6            INITPIA 
+ 1294  0ED6  A0 00             LDY     #0
+ 1295  0ED8  A9 40             LDA     #$40
+ 1296  0EDA  8C 01 C0          STY     DDPIA+1 ; SELECT DDRA
+ 1297  0EDD  8D 00 C0          STA     DDPIA   ; SET PORTA TO ALL INPUTS except PA6
+ 1298  0EE0  A2 04             LDX     #4              ; 0000 0100
+ 1299  0EE2  8E 01 C0          STX     DDPIA+1 ; SELECT PORTA
+ 1300  0EE5  8D 00 C0          STA     DDPIA    ; SET PB6 HIGH
+ 1301  0EE8  8C 03 C0          STY     DDPIA+3 ; SELECT DDRB
+ 1302  0EEB  88                DEY
+ 1303  0EEC  8C 02 C0          STY     DDPIA+2 ; SET PORTB TO ALL OUTPUTS
+ 1304  0EEF  8E 03 C0          STX     DDPIA+3 ; SELECT PORTB
+ 1305  0EF2  8C 02 C0          STY     DDPIA+2 ; SET PORTB OUTPUTS HIGH
+ 1306  0EF5  60                RTS
+ 1307                  
+ 1308                  
+ 1309                  ;SELECT DRIVE PB5 PA6  DRIVE (1-4)
+ 1310                  ;              0   0    #4
+ 1311                  ;              0   1    #3
+ 1312                  ;              1   0    #2
+ 1313                  ;              1   1    #1
+ 1314                  
+ 1315  0EF6            SELDRV
+ 1316  0EF6  A5 2D             LDA     DRVNUM
+ 1317  0EF8  4A                LSR     A
+ 1318  0EF9  A8                TAY
+ 1319  0EFA  90 03             BCC     *+5
+ 1320  0EFC  A9 00             LDA     #$00
+ 1321  0EFE  2C A9 40          BIT     $40A9   ; This is LDA #$40 if BCC branches
+ 1322  0F01  8D 00 C0          STA     DDPIA   ; This is A/B select in port A
+ 1323  0F04  AD 02 C0          LDA     DDPIA+2
+ 1324  0F07  09 20             ORA     #$20
+ 1325  0F09  C0 01             CPY     #$01
+ 1326  0F0B  90 02             BCC     *+4
+ 1327  0F0D  29 DF             AND     #$DF
+ 1328  0F0F  8D 02 C0          STA     DDPIA+2 ; This is master select in port B
+ 1329  0F12  60                RTS
+ 1330                  
+ 1331                  
+ 1332                  ; STEP TO TRACK 0. Carry clear if no error. A modified. TRK set to 0
+ 1333                  ; if no error.
+ 1334                  
+ 1335  0F13            TZERO
+ 1336  0F13  A5 2A             LDA     MAXTRK  ;max num tracks
+ 1337  0F15  69 08             ADC     #$08    ;plus a few more
+ 1338  0F17  85 2F             STA     TMP             ;MAX times to step before abort
+ 1339  0F19  AD 02 C0          LDA     DDPIA+2
+ 1340  0F1C  29 FB             AND     #$FB    ; 1111 1011
+ 1341  0F1E  D0 1B             BNE     TZERO3  ; DIR=INWARDS, start with one step away from track 0
+ 1342                  
+ 1343  0F20            TZERO1
+ 1344  0F20  C6 2F             DEC     TMP
+ 1345  0F22  D0 02             BNE     TZERO5
+ 1346  0F24  38                SEC
+ 1347  0F25  60                RTS
+ 1348  0F26            TZERO5  
+ 1349  0F26  A9 02             LDA     #2              ; 0000 0010
+ 1350  0F28  2C 00 C0          BIT     DDPIA   ; TEST 'TRK0' PIN
+ 1351  0F2B  D0 09             BNE     TZERO2  ; AT TRACK 0
+ 1352  0F2D  A9 00             LDA     #0
+ 1353  0F2F  85 2E             STA     TRK
+ 1354  0F31  20 99 0F          JSR     REDWR
+ 1355  0F34  18                CLC
+ 1356  0F35  60                RTS
+ 1357                  
+ 1358  0F36            TZERO2  
+ 1359  0F36  AD 02 C0          LDA     DDPIA+2 ; DIR=OUTWARDS (TO TRK0)
+ 1360  0F39  09 04             ORA     #$04
+ 1361  0F3B            TZERO3  
+ 1362  0F3B  8D 02 C0          STA     DDPIA+2 ; SET 'DIR' PIN
+ 1363  0F3E  20 B5 0F          JSR     DELAY2
+ 1364  0F41  29 F7             AND     #$F7    ; 1111 0111
+ 1365  0F43  8D 02 C0          STA     DDPIA+2 ; SET 'STEP' PIN LOW
+ 1366  0F46  20 B5 0F          JSR     DELAY2
+ 1367  0F49  09 08             ORA     #8              ; 0000 1000
+ 1368  0F4B  8D 02 C0          STA     DDPIA+2 ; SET 'STEP' PIN HIGH
+ 1369  0F4E  A2 20             LDX     #32     ; 40 MS
+ 1370  0F50  20 AA 0F          JSR     DELAY
+ 1371  0F53  F0 CB             BEQ     TZERO1  ; ALWAYS
+ 1372                  
+ 1373                  ; STEP TO PREVIOUS TRACK
+ 1374  0F55            TPREV
+ 1375  0F55  AD 02 C0          LDA     DDPIA+2 ; DIR=(TO TRK0)
+ 1376  0F58  09 04             ORA     #$04
+ 1377  0F5A  8D 02 C0          STA     DDPIA+2 ; SET 'DIR' PIN
+ 1378  0F5D  20 B5 0F          JSR     DELAY2
+ 1379  0F60  29 F7             AND     #$F7    ; 1111 0111
+ 1380  0F62  8D 02 C0          STA     DDPIA+2 ; SET 'STEP' PIN LOW
+ 1381  0F65  20 B5 0F          JSR     DELAY2
+ 1382  0F68  09 08             ORA     #8              ; 0000 1000
+ 1383  0F6A  8D 02 C0          STA     DDPIA+2 ; SET 'STEP' PIN HIGH
+ 1384  0F6D  C6 2E             DEC     TRK
+ 1385  0F6F  20 99 0F          JSR     REDWR   ; Set reduced write current
+ 1386  0F72  A2 20             LDX     #32     ; 40 MS
+ 1387  0F74  4C AA 0F          JMP     DELAY
+ 1388                  
+ 1389                  ; STEP TO NEXT TRACK
+ 1390                  
+ 1391  0F77            TNEXT   
+ 1392  0F77  AD 02 C0          LDA DDPIA+2
+ 1393  0F7A  29 FB             AND     #$FB    ; 1111 1011
+ 1394                                                  ; DIR=INWARDS
+ 1395  0F7C  8D 02 C0          STA     DDPIA+2 ; SET 'DIR' PIN
+ 1396  0F7F  20 B5 0F          JSR     DELAY2
+ 1397  0F82  29 F7             AND     #$F7    ; 1111 0111
+ 1398  0F84  8D 02 C0          STA     DDPIA+2 ; SET 'STEP' LOW
+ 1399  0F87  20 B5 0F          JSR     DELAY2
+ 1400  0F8A  09 08             ORA     #8              ; 0000 1000
+ 1401  0F8C  8D 02 C0          STA     DDPIA+2 ; SET 'STEP' HIGH
+ 1402  0F8F  E6 2E             INC     TRK
+ 1403  0F91  20 99 0F          JSR     REDWR   ; Set reduced write current
+ 1404  0F94  A2 20             LDX     #32         ; 40MS
+ 1405  0F96  4C AA 0F          JMP     DELAY
+ 1406                  
+ 1407                          ; Set reduced write current
+ 1408  0F99            REDWR
+ 1409  0F99  A5 2E             LDA     TRK
+ 1410  0F9B  C9 2B             CMP     #43     ; Is track >= 43
+ 1411  0F9D  AD 02 C0          LDA     DDPIA+2
+ 1412  0FA0  29 BF             AND     #$BF    ; Set low current active
+ 1413  0FA2  B0 02             BCS     SETLO   ; Yes
+ 1414  0FA4  09 40             ORA     #$40    ; Set low current inactive
+ 1415  0FA6            SETLO
+ 1416  0FA6  8D 02 C0          STA     DDPIA+2
+ 1417  0FA9  60                RTS
+ 1418                  
+ 1419                  ; DELAY 1.25MS PER LOOP at 1 MHz clock. X,Y modified
+ 1420                  
+ 1421  0FAA            DELAY   
+ 1422  0FAA  A0 F8             LDY     #$F8
+ 1423  0FAC            DELAY1  
+ 1424  0FAC  88                DEY
+ 1425  0FAD  D0 FD             BNE     DELAY1
+ 1426  0FAF  55 FF             EOR     $FF,X
+ 1427  0FB1  CA                DEX
+ 1428  0FB2  D0 F6             BNE     DELAY
+ 1429  0FB4  60                RTS
+ 1430                  
+ 1431  0FB5            DELAY2  
+ 1432  0FB5  20 B8 0F          JSR     DELAY21
+ 1433  0FB8            DELAY21 
+ 1434  0FB8  60                RTS
+ 1435                  
+ 1436                  
+ 1437                  ; PRINT IN-LINE STRING. Y and A modified
+ 1438                  
+ 1439  0FB9            PRINT   
+ 1440  0FB9  68                PLA
+ 1441  0FBA  85 6A             STA     PTRSTOR
+ 1442  0FBC  68                PLA
+ 1443  0FBD  85 6B             STA     PTRSTOR+1
+ 1444  0FBF  A0 01             LDY     #1
+ 1445  0FC1            PRINT1  
+ 1446  0FC1  B1 6A             LDA     (PTRSTOR),Y
+ 1447  0FC3  F0 0A             BEQ     PRINT2
+ 1448  0FC5  20 30 12          JSR     OUTPUT
+ 1449  0FC8  C8                INY
+ 1450  0FC9  D0 F6             BNE     PRINT1
+ 1451  0FCB  E6 6B             INC PTRSTOR+1
+ 1452  0FCD  D0 F2             BNE PRINT1
+ 1453  0FCF            PRINT2  
+ 1454  0FCF  98                TYA
+ 1455  0FD0  38                SEC
+ 1456  0FD1  65 6A             ADC     PTRSTOR
+ 1457  0FD3  A4 6A             LDY     PTRSTOR
+ 1458  0FD5  85 6A             STA     PTRSTOR
+ 1459  0FD7  90 02             BCC     PRINT3
+ 1460  0FD9  E6 6B             INC     PTRSTOR+1
+ 1461  0FDB            PRINT3
+ 1462  0FDB  18                CLC
+ 1463  0FDC  6C 6A 00          JMP     (PTRSTOR)
+ 1464                  
+ 1465                  ; PRINT HEX WORD (A,X). ONLY CHANGES A
+ 1466                  
+ 1467  0FDF            PHEX    
+ 1468  0FDF  20 E3 0F          JSR     PHEXA
+ 1469  0FE2  8A                TXA
+ 1470                  
+ 1471                  ; PRINT HEX BYTE (A)
+ 1472  0FE3            PHEXA   
+ 1473  0FE3  48                PHA
+ 1474  0FE4  4A                LSR     A
+ 1475  0FE5  4A                LSR     A
+ 1476  0FE6  4A                LSR     A
+ 1477  0FE7  4A                LSR     A
+ 1478  0FE8  20 EC 0F          JSR     PHEXA1
+ 1479  0FEB  68                PLA
+ 1480  0FEC            PHEXA1  
+ 1481  0FEC  29 0F             AND     #$F
+ 1482  0FEE  09 30             ORA     #'0'
+ 1483  0FF0  C9 3A             CMP     #'9'+1
+ 1484  0FF2  30 03             BMI     PHEXA2
+ 1485  0FF4  18                CLC
+ 1486  0FF5  69 07             ADC     #7
+ 1487  0FF7            PHEXA2  
+ 1488  0FF7  4C 30 12          JMP     OUTPUT
+ 1489                  
+ 1490                  ; PRINT DECIMAL (A)
+ 1491  0FFA            PDECA   
+ 1492  0FFA  AA                TAX
+ 1493  0FFB  A9 00             LDA     #0
+ 1494                  
+ 1495                  ; PRINT DECIMAL (A,X). CHANGES A,X,Y. Prints with no leading space
+ 1496                  
+ 1497  0FFD            PDEC    
+ 1498  0FFD  86 43             STX num
+ 1499  0FFF  85 44             STA num+1
+ 1500  1001  A9 00             LDA #0
+ 1501  1003  85 59             STA pad
+ 1502  1005  A0 06             LDY #6  ; 4 digits max
+ 1503  1007  4C 56 08          JMP PrDec16Lp1
+ 1504                  
+ 1505  100A            CRLF    
+ 1506  100A  A9 0D             LDA     #CR
+ 1507  100C  20 30 12          JSR     OUTPUT
+ 1508  100F  A9 0A             LDA     #LF
+ 1509  1011  4C 30 12          JMP     OUTPUT
+ 1510                  
+ 1511  1014            ANYKEY  
+ 1512  1014  20 E7 11          JSR     Get_Chr
+ 1513  1017  20 B9 0F          JSR     PRINT
+ 1514  101A  0D 0A             .BYTE   CR,LF
+ 1515  101C  50 52 45          .BYTE   'PRESS ANY KEY WHEN READY >',0
+       101F  53 53 20  
+       1022  41 4E 59  
+       1025  20 4B 45  
+       1028  59 20 57  
+       102B  48 45 4E  
+       102E  20 52 45  
+       1031  41 44 59  
+       1034  20 3E 00  
+ 1516  1037  20 FF 11          JSR     INKEY
+ 1517  103A  20 B9 0F          JSR     PRINT
+ 1518  103D  0D 0A 00          .BYTE   CR,LF,0
+ 1519  1040  60                RTS
+ 1520                  
+ 1521  1041            DRWMENU
+ 1522  1041  20 B9 0F           JSR PRINT
+ 1523  1044  0D 0A 0D          .BYTE $D,$A,$D,$A
+       1047  0A        
+ 1524  1048  20 4F 53          .BYTE ' OSI DESTRUCTIVE Disk Test',$D,$A          
+       104B  49 20 44  
+       104E  45 53 54  
+       1051  52 55 43  
+       1054  54 49 56  
+       1057  45 20 44  
+       105A  69 73 6B  
+       105D  20 54 65  
+       1060  73 74 0D  
+       1063  0A        
+ 1525  1064  2D 2D 2D          .BYTE '--------------------------',$D,$A          
+       1067  2D 2D 2D  
+       106A  2D 2D 2D  
+       106D  2D 2D 2D  
+       1070  2D 2D 2D  
+       1073  2D 2D 2D  
+       1076  2D 2D 2D  
+       1079  2D 2D 2D  
+       107C  2D 2D 0D  
+       107F  0A        
+ 1526  1080  31 2E 20          .BYTE '1. Test Disk',$D,$A
+       1083  54 65 73  
+       1086  74 20 44  
+       1089  69 73 6B  
+       108C  0D 0A     
+ 1527  108E  32 2E 20          .BYTE '2. Test Track',$D,$A
+       1091  54 65 73  
+       1094  74 20 54  
+       1097  72 61 63  
+       109A  6B 0D 0A  
+ 1528  109D  33 2E 20          .BYTE '3. Select Drive',$D,$A      
+       10A0  53 65 6C  
+       10A3  65 63 74  
+       10A6  20 44 72  
+       10A9  69 76 65  
+       10AC  0D 0A     
+ 1529  10AE  34 2E 20          .BYTE '4. Set Drive Type',$D,$A      
+       10B1  53 65 74  
+       10B4  20 44 72  
+       10B7  69 76 65  
+       10BA  20 54 79  
+       10BD  70 65 0D  
+       10C0  0A        
+ 1530  10C1  35 2E 20          .BYTE '5. Set Pattern and passes',$D,$A
+       10C4  53 65 74  
+       10C7  20 50 61  
+       10CA  74 74 65  
+       10CD  72 6E 20  
+       10D0  61 6E 64  
+       10D3  20 70 61  
+       10D6  73 73 65  
+       10D9  73 0D 0A  
+ 1531  10DC  36 2E 20          .BYTE '6. Toggle read only',$D,$A
+       10DF  54 6F 67  
+       10E2  67 6C 65  
+       10E5  20 72 65  
+       10E8  61 64 20  
+       10EB  6F 6E 6C  
+       10EE  79 0D 0A  
+ 1532  10F1  37 2E 20          .BYTE '7. RPM Test',$D,$A 
+       10F4  52 50 4D  
+       10F7  20 54 65  
+       10FA  73 74 0D  
+       10FD  0A        
+ 1533  10FE  38 2E 20          .BYTE '8. Status screen',$D,$A 
+       1101  53 74 61  
+       1104  74 75 73  
+       1107  20 73 63  
+       110A  72 65 65  
+       110D  6E 0D 0A  
+ 1534  1110  39 2E 20          .BYTE '9. Exit',$D,$A          
+       1113  45 78 69  
+       1116  74 0D 0A  
+ 1535  1119  0D 0A             .BYTE $D,$A
+ 1536  111B  44 72 76          .BYTE 'Drv=',$0
+       111E  3D 00     
+ 1537  1120  A5 2D             LDA DRVNUM
+ 1538  1122  18                CLC
+ 1539  1123  69 41             ADC #$41
+ 1540  1125  20 30 12          JSR OUTPUT
+ 1541  1128  A5 2B             LDA MAXPAG
+ 1542  112A  C9 0F             CMP #MAXPAG8
+ 1543  112C  F0 0C             BEQ DRWMN1
+ 1544  112E  20 B9 0F          JSR PRINT
+ 1545  1131  2F 35 2E          .BYTE '/5.25 ',0
+       1134  32 35 20  
+       1137  00        
+ 1546  1138  90 07             BCC DRWMN2
+ 1547  113A            DRWMN1
+ 1548  113A  20 B9 0F          JSR PRINT
+ 1549  113D  2F 38 20          .BYTE '/8 ',0
+       1140  00        
+ 1550  1141            DRWMN2
+ 1551  1141  A5 32             LDA PATSEL
+ 1552  1143  D0 15             BNE DRWMN3
+ 1553  1145  20 B9 0F          JSR PRINT
+ 1554  1148  50 61 74          .BYTE 'Pattern $',0
+       114B  74 65 72  
+       114E  6E 20 24  
+       1151  00        
+ 1555  1152  A5 33             LDA PATVAL
+ 1556  1154  20 E3 0F          JSR PHEXA
+ 1557  1157  4C 6C 11          JMP DRWMN4
+ 1558  115A            DRWMN3
+ 1559  115A  20 B9 0F          JSR PRINT
+ 1560  115D  50 61 74          .BYTE 'Pattern random',0
+       1160  74 65 72  
+       1163  6E 20 72  
+       1166  61 6E 64  
+       1169  6F 6D 00  
+ 1561  116C            DRWMN4
+ 1562  116C  20 B9 0F          JSR PRINT
+ 1563  116F  20 20 50          .BYTE '  Passes ',0
+       1172  61 73 73  
+       1175  65 73 20  
+       1178  00        
+ 1564  1179  A5 34             LDA PASSES
+ 1565  117B  20 FA 0F          JSR PDECA
+ 1566  117E  A5 68             LDA TESTTYPE
+ 1567  1180  F0 12             BEQ NORMTEST
+ 1568  1182  20 B9 0F          JSR PRINT
+ 1569  1185  20 53 63          .BYTE ' Scope test',0
+       1188  6F 70 65  
+       118B  20 74 65  
+       118E  73 74 00  
+ 1570  1191  4C A4 11          JMP RWRO
+ 1571  1194            NORMTEST
+ 1572  1194  20 B9 0F          JSR PRINT
+ 1573  1197  20 4E 6F          .BYTE ' Normal test',0
+       119A  72 6D 61  
+       119D  6C 20 74  
+       11A0  65 73 74  
+       11A3  00        
+ 1574  11A4            RWRO
+ 1575  11A4  A5 35             LDA READONLY
+ 1576  11A6  F0 11             BEQ RW
+ 1577  11A8  20 B9 0F          JSR PRINT
+ 1578  11AB  20 52 65          .BYTE ' Read only',0
+       11AE  61 64 20  
+       11B1  6F 6E 6C  
+       11B4  79 00     
+ 1579  11B6  4C C1 11          JMP PPROMPT
+ 1580  11B9            RW
+ 1581  11B9  20 B9 0F          JSR PRINT
+ 1582  11BC  20 52 2F          .BYTE ' R/W',0
+       11BF  57 00     
+ 1583  11C1            PPROMPT
+ 1584  11C1  20 B9 0F          JSR PRINT
+ 1585  11C4  20 3E 20          .BYTE ' > ',0
+       11C7  00        
+ 1586  11C8  60                RTS
+ 1587                  
+ 1588                          ; Get key from polled key without waiting. Carry clear if no key
+ 1589                          ; Key returned in A. X,Y modified
+ 1590  11C9            Get_Chr_Polled
+ 1591  11C9  A9 02             LDA #2          ; Ignore shift lock
+ 1592  11CB  A0 00             LDY #0
+ 1593  11CD            Check_Polled_Loop
+ 1594  11CD  8D 00 DF          STA $DF00       ; Select row
+ 1595  11D0  8D 00 DF          STA $DF00       ; In case some time needed for signals to propagate
+ 1596  11D3  AE 00 DF          LDX $DF00
+ 1597  11D6  F0 01             BEQ Polled_No_Key       ; Jmp if no pressed?
+ 1598  11D8  C8                INY
+ 1599  11D9            Polled_No_Key
+ 1600  11D9  0A                ASL
+ 1601  11DA  D0 F1             BNE Check_Polled_Loop
+ 1602  11DC  C0 01             CPY #1          ; If we found other than 1 key pressed assume no
+ 1603                                          ; key pressed. May not have a keyboard port
+ 1604  11DE  F0 02             BEQ Polled_Got_Key
+ 1605  11E0  18                CLC
+ 1606  11E1  60                RTS
+ 1607  11E2            Polled_Got_Key
+ 1608  11E2  20 ED FE          JSR $FEED
+ 1609  11E5  38                SEC
+ 1610  11E6  60                RTS
+ 1611                          
+ 1612                  
+ 1613  11E7            Get_Chr
+ 1614  11E7            FRACIANW  ; read from ACIA no wait      carry clear when no data
+ 1615  11E7  24 30             BIT MACHINE
+ 1616  11E9  30 0A             BMI FRAC1NW
+ 1617  11EB  AD 00 FC          LDA C2ACIA
+ 1618  11EE  4A                LSR A
+ 1619  11EF  90 03             BCC FRAC1NW-1
+ 1620  11F1  AD 01 FC          LDA C2ACIA+1
+ 1621  11F4  60                RTS
+ 1622  11F5            FRAC1NW
+ 1623  11F5  AD 00 F0          LDA C1ACIA
+ 1624  11F8  4A                LSR A    
+ 1625  11F9  90 F9             BCC FRAC1NW-1 
+ 1626  11FB  AD 01 F0          LDA C1ACIA+1
+ 1627  11FE  60                RTS
+ 1628                  
+ 1629                          ; Get key from serial or polled keyboard waiting for key.
+ 1630  11FF            INKEY
+ 1631  11FF  24 31             BIT VIDEO
+ 1632  1201  10 03             BPL *+5         ; No
+ 1633  1203  4C ED FE          JMP $FEED       ; Polled keyboard
+ 1634  1206  24 30             BIT MACHINE
+ 1635  1208            FRACIA           ;read from ACIA carry set on abort return value in A
+ 1636  1208  30 0B             BMI FRAC1
+ 1637  120A            FRSER                   ; read from C3
+ 1638  120A  AD 00 FC          LDA C2ACIA
+ 1639  120D  4A                LSR A    
+ 1640  120E  90 F8             BCC FRACIA 
+ 1641  1210  AD 01 FC          LDA C2ACIA+1
+ 1642  1213  18                CLC      
+ 1643  1214            ACIARET
+ 1644  1214  60                RTS
+ 1645  1215            FRAC1                   ;read from C1
+ 1646  1215  AD 00 F0          LDA C1ACIA
+ 1647  1218  4A                LSR A    
+ 1648  1219  90 ED             BCC FRACIA 
+ 1649  121B  AD 01 F0          LDA C1ACIA+1
+ 1650  121E  18                CLC       
+ 1651  121F  60                RTS
+ 1652                  
+ 1653                          ; Check if TX ready bit is set for serial. Carry set if ready
+ 1654  1220            CheckTXReady
+ 1655  1220  24 30             BIT MACHINE
+ 1656  1222  30 06             BMI TOAC1B
+ 1657  1224  AD 00 FC          LDA C2ACIA   ;wait for TxEmpty
+ 1658  1227  4A                LSR A     
+ 1659  1228  4A                LSR A     
+ 1660  1229  60                RTS     ; Carry set if TX ready
+ 1661  122A            TOAC1B
+ 1662  122A  AD 00 F0          LDA C1ACIA 
+ 1663  122D  4A                LSR A     
+ 1664  122E  4A                LSR A     
+ 1665  122F  60                RTS     ; Carry set if TX ready
+ 1666                  
+ 1667                          ; Write a character to serial or video. A modified
+ 1668  1230            OUTPUT
+ 1669  1230            Put_Chr
+ 1670  1230            TOACIA    
+ 1671  1230  24 31             BIT VIDEO
+ 1672  1232  10 03             BPL TOACIA2     ; No, not video system
+ 1673  1234  4C 54 12          JMP VIDOUT
+ 1674  1237            TOACIA2
+ 1675  1237  48                PHA
+ 1676  1238  24 30             BIT MACHINE
+ 1677  123A  30 0C             BMI TOAC1
+ 1678  123C            TOACIA1        
+ 1679  123C  AD 00 FC          LDA C2ACIA   ;wait for TxEmpty
+ 1680  123F  4A                LSR A     
+ 1681  1240  4A                LSR A     
+ 1682  1241  90 F9             BCC TOACIA1   
+ 1683  1243  68                PLA       
+ 1684  1244  8D 01 FC          STA C2ACIA+1 
+ 1685  1247  60                RTS       
+ 1686  1248            TOAC1
+ 1687  1248  AD 00 F0          LDA C1ACIA 
+ 1688  124B  4A                LSR A     
+ 1689  124C  4A                LSR A     
+ 1690  124D  90 F9             BCC TOAC1   
+ 1691  124F  68                PLA       
+ 1692  1250  8D 01 F0          STA C1ACIA+1 
+ 1693  1253  60                RTS 
+ 1694                  
+ 1695                          ; Video output routine
+ 1696  1254            VIDOUT
+ 1697  1254  84 67             STY YHOLD 
+ 1698  1256  C9 0D             CMP #CR
+ 1699  1258  F0 0F             BEQ VIDCR
+ 1700  125A  C9 0A             CMP #LF
+ 1701  125C  F0 10             BEQ VIDLF
+ 1702  125E  A4 74             LDY VIDOFFSET
+ 1703  1260  99 C0 D6          STA $D6C0,Y
+ 1704  1263  C8                INY
+ 1705  1264  84 74             STY VIDOFFSET
+ 1706  1266            VIDRETY
+ 1707  1266  A4 67             LDY YHOLD
+ 1708  1268  60                RTS
+ 1709  1269            VIDCR
+ 1710  1269  A9 00             LDA #0
+ 1711  126B  85 74             STA VIDOFFSET
+ 1712  126D  60                RTS     
+ 1713  126E            VIDLF
+ 1714  126E  B1 70             LDA (VIDSRC),Y
+ 1715  1270  91 72             STA (VIDDST),Y
+ 1716  1272  C8                INY
+ 1717  1273  D0 F9             BNE VIDLF
+ 1718  1275  E6 71             INC VIDSRC+1
+ 1719  1277  E6 73             INC VIDDST+1
+ 1720  1279  A5 71             LDA VIDSRC+1
+ 1721  127B  C9 D7             CMP #$D7
+ 1722  127D  D0 EF             BNE VIDLF
+ 1723  127F  A9 D0             LDA #$D0
+ 1724  1281  85 71             STA VIDSRC+1
+ 1725  1283  85 73             STA VIDDST+1
+ 1726  1285  A9 20             LDA #' '
+ 1727  1287            VIDCLR
+ 1728  1287  99 C0 D6          STA $D6C0,Y     ; Clear last line
+ 1729  128A  C8                INY
+ 1730  128B  C0 40             CPY #$40
+ 1731  128D  D0 F8             BNE VIDCLR
+ 1732  128F  C8                INY
+ 1733  1290  4C 66 12          JMP VIDRETY
+ 1734                          
+ 1735                          
+ 1736                  
+ 1737                  ; Return an 8 bit "random" number in A
+ 1738                  ; X modified on return
+ 1739                  ; From http://forum.6502.org/viewtopic.php?f=2&t=5247 modified for better
+ 1740                  ; randomness
+ 1741  1293            RAND
+ 1742  1293  A5 3B             LDA RND+4       ; ADD B shifted, 
+ 1743  1295  38                SEC             ; carry adds value 0x80
+ 1744  1296  6A                ROR
+ 1745  1297  65 38             ADC RND+1       ; add last value (E)
+ 1746  1299  65 3C             ADC RND+5       ; add C
+ 1747  129B  85 37             STA RND         ; new number
+ 1748  129D  A2 04             LDX #4          ; move 5 numbers
+ 1749  129F            RPL
+ 1750  129F  B5 37             LDA RND,X
+ 1751  12A1  95 38             STA RND+1,X     ; ..move over 1
+ 1752  12A3  CA                DEX
+ 1753  12A4  10 F9             BPL RPL         ; all moved?
+ 1754  12A6  A5 37             LDA RND
+ 1755  12A8  60                RTS
+ 1756                  
+ 1757                  ; From https://codebase64.org/doku.php?id=base:24bit_division_24-bit_result
+ 1758                  ; EXECUTES AN UNSIGNED INTEGER DIVISION OF A 24-BIT DIVIDEND BY A 24-BIT DIVISOR
+ 1759                  ; THE RESULT GOES TO DIVIDEND AND REMAINDER VARIABLES
+ 1760                  ;
+ 1761                  ; VERZ!!! 18-MAR-2017
+ 1762                  ; A, X, Y modified.
+ 1763                  
+ 1764  12A9  A9 00     DIV24   LDA #0          ;PRESET REMAINDER TO 0
+ 1765  12AB  85 49             STA REMAINDER
+ 1766  12AD  85 4A             STA REMAINDER+1
+ 1767  12AF  85 4B             STA REMAINDER+2
+ 1768  12B1  A2 18             LDX #24         ;REPEAT FOR EACH BIT: ...
+ 1769                  
+ 1770  12B3  06 43     DIVLOOP ASL DIVIDEND    ;DIVIDEND LB & HB*2, MSB -> CARRY
+ 1771  12B5  26 44             ROL DIVIDEND+1  
+ 1772  12B7  26 45             ROL DIVIDEND+2
+ 1773  12B9  26 49             ROL REMAINDER   ;REMAINDER LB & HB * 2 + MSB FROM CARRY
+ 1774  12BB  26 4A             ROL REMAINDER+1
+ 1775  12BD  26 4B             ROL REMAINDER+2
+ 1776  12BF  A5 49             LDA REMAINDER
+ 1777  12C1  38                SEC
+ 1778  12C2  E5 46             SBC DIVISOR     ;SUBSTRACT DIVISOR TO SEE IF IT FITS IN
+ 1779  12C4  A8                TAY             ;LB RESULT -> Y, FOR WE MAY NEED IT LATER
+ 1780  12C5  A5 4A             LDA REMAINDER+1
+ 1781  12C7  E5 47             SBC DIVISOR+1
+ 1782  12C9  85 4F             STA PZTEMP
+ 1783  12CB  A5 4B             LDA REMAINDER+2
+ 1784  12CD  E5 48             SBC DIVISOR+2
+ 1785  12CF  90 0A             BCC SKIP        ;IF CARRY=0 THEN DIVISOR DIDN'T FIT IN YET
+ 1786                  
+ 1787  12D1  85 4B             STA REMAINDER+2 ;ELSE SAVE SUBSTRACTION RESULT AS NEW REMAINDER,
+ 1788  12D3  A5 4F             LDA PZTEMP
+ 1789  12D5  85 4A             STA REMAINDER+1
+ 1790  12D7  84 49             STY REMAINDER   
+ 1791  12D9  E6 43             INC DIVIDEND    ;AND INCREMENT RESULT CAUSE DIVISOR FIT IN 1 TIMES
+ 1792                  
+ 1793  12DB  CA        SKIP    DEX
+ 1794  12DC  D0 D5             BNE DIVLOOP     
+ 1795  12DE  60                RTS
+ 1796                  
+ 1797                  
+ 1798                  ; From https://codebase64.org/doku.php?id=base:24bit_multiplication_24bit_product
+ 1799                  ; Multiply REMAINDER by DIVIDEND with result in DIVIDEND
+ 1800  0049            factor1 = REMAINDER
+ 1801  0043            product = DIVIDEND
+ 1802  12DF            MULT24
+ 1803  12DF  A9 00             lda #$00                        ; set product to zero
+ 1804  12E1  85 43             sta product
+ 1805  12E3  85 44             sta product+1
+ 1806  12E5  85 45             sta product+2
+ 1807                  
+ 1808  12E7            mloop
+ 1809  12E7  A5 4C             lda factor2                     ; while factor2 != 0
+ 1810  12E9  D0 09             bne nz
+ 1811  12EB  A5 4D             lda factor2+1
+ 1812  12ED  D0 05             bne nz
+ 1813  12EF  A5 4E             lda factor2+2
+ 1814  12F1  D0 01             bne nz
+ 1815  12F3  60                rts
+ 1816  12F4            nz
+ 1817  12F4  A5 4C             lda factor2                     ; if factor2 is odd
+ 1818  12F6  29 01             and #$01
+ 1819  12F8  F0 13             beq mskip
+ 1820                          
+ 1821  12FA  A5 49             lda factor1                     ; product += factor1
+ 1822  12FC  18                clc
+ 1823  12FD  65 43             adc product
+ 1824  12FF  85 43             sta product
+ 1825                          
+ 1826  1301  A5 4A             lda factor1+1
+ 1827  1303  65 44             adc product+1
+ 1828  1305  85 44             sta product+1
+ 1829                          
+ 1830  1307  A5 4B             lda factor1+2
+ 1831  1309  65 45             adc product+2
+ 1832  130B  85 45             sta product+2                   ; end if
+ 1833                  
+ 1834  130D            mskip
+ 1835  130D  06 49             asl factor1                     ; << factor1 
+ 1836  130F  26 4A             rol factor1+1
+ 1837  1311  26 4B             rol factor1+2
+ 1838  1313  46 4E             lsr factor2+2                   ; >> factor2
+ 1839  1315  66 4D             ror factor2+1
+ 1840  1317  66 4C             ror factor2
+ 1841                  
+ 1842  1319  4C E7 12          jmp mloop                       ; end while     
+ 1843                  
+ 1844                  ; Status screen for displaying drive inputs
+ 1845                  ;  Commands:
+ 1846                  ;  Z- Zero Head   U - Step Up  D - Step Down   E Exit
+ 1847                  ;  R - Read Trk(not implemented) H - load/unload head 
+ 1848                  ;  S - Select disk, W - Write
+ 1849                  ;
+ 1850  002F            LASTPIA = TMP ; need a storage location
+ 1851  131C            STATSCRN
+ 1852  131C  A9 AA             LDA #$AA
+ 1853  131E  85 2F             STA LASTPIA
+ 1854  1320  20 D6 0E          JSR INITPIA     ; Select disk
+ 1855  1323  20 F6 0E          JSR SELDRV
+ 1856  1326  A9 20             LDA #$20        ; Turn master select back off
+ 1857  1328  4D 02 C0          EOR DDPIA+2
+ 1858  132B  8D 02 C0          STA DDPIA+2
+ 1859                          ; JSR PRINT
+ 1860                          ;.BYTE $1B,$48,$D,$A,0 ;escape codes to Home cursor no big deal if terminal doesn't respond correctl
+ 1861                  
+ 1862  132E  20 B9 0F          JSR PRINT
+ 1863  1331  0D 0A 0D          .BYTE $D,$A,$D,$A,'CMDS:(S)el (H)ead (W)rite Step:(U)p (D)own (Z)ero (E)xit',$D, $A
+       1334  0A 43 4D  
+       1337  44 53 3A  
+       133A  28 53 29  
+       133D  65 6C 20  
+       1340  28 48 29  
+       1343  65 61 64  
+       1346  20 28 57  
+       1349  29 72 69  
+       134C  74 65 20  
+       134F  53 74 65  
+       1352  70 3A 28  
+       1355  55 29 70  
+       1358  20 28 44  
+       135B  29 6F 77  
+       135E  6E 20 28  
+       1361  5A 29 65  
+       1364  72 6F 20  
+       1367  28 45 29  
+       136A  78 69 74  
+       136D  0D 0A     
+ 1864  136F  20 0D 0A          .BYTE ' ',$D, $A
+ 1865  1372  52 20 54          .BYTE 'R T F S R W S I',$D, $A
+       1375  20 46 20  
+       1378  53 20 52  
+       137B  20 57 20  
+       137E  53 20 49  
+       1381  0D 0A     
+ 1866  1383  44 20 52          .BYTE 'D R A E D R e N',$D, $A
+       1386  20 41 20  
+       1389  45 20 44  
+       138C  20 52 20  
+       138F  65 20 4E  
+       1392  0D 0A     
+ 1867  1394  59 20 4B          .BYTE 'Y K U C Y I l D',$D, $A
+       1397  20 55 20  
+       139A  43 20 59  
+       139D  20 49 20  
+       13A0  6C 20 44  
+       13A3  0D 0A     
+ 1868  13A5  31 20 30          .BYTE '1 0 L T 2 T 1 E',$D, $A
+       13A8  20 4C 20  
+       13AB  54 20 32  
+       13AE  20 54 20  
+       13B1  31 20 45  
+       13B4  0D 0A     
+ 1869  13B6  20 20 20          .BYTE '    T     P   X',$D, $A
+       13B9  20 54 20  
+       13BC  20 20 20  
+       13BF  20 50 20  
+       13C2  20 20 58  
+       13C5  0D 0A     
+ 1870  13C7  00                .BYTE 0
+ 1871                          ;, $1B, $48,0
+ 1872                  
+ 1873  13C8            STATSCR2
+ 1874  13C8  AD 00 C0          LDA DDPIA
+ 1875  13CB            STATSCR5
+ 1876  13CB  85 2F             STA LASTPIA
+ 1877  13CD  A2 08             LDX #$08
+ 1878  13CF            STATSCR1
+ 1879  13CF  4A                LSR A
+ 1880  13D0  48                PHA
+ 1881  13D1  90 01             BCC *+3
+ 1882  13D3  A9 30             LDA #$30
+ 1883  13D5  2C A9 31          BIT $31A9
+ 1884  13D8  20 30 12          JSR OUTPUT
+ 1885  13DB  A9 20             LDA #$20
+ 1886  13DD  20 30 12          JSR OUTPUT
+ 1887  13E0  68                PLA
+ 1888  13E1  CA                DEX
+ 1889  13E2  D0 EB             BNE STATSCR1
+ 1890  13E4  20 B9 0F          JSR PRINT
+ 1891  13E7  20 54 52          .BYTE ' TRK ',0
+       13EA  4B 20 00  
+ 1892  13ED  A5 2E             LDA TRK
+ 1893  13EF  20 38 08          JSR PrDec2Dig
+ 1894  13F2  A9 0D             LDA #$0D
+ 1895  13F4  20 30 12          JSR OUTPUT  ;keep redrawing current line- no LF
+ 1896  13F7            STATSCR4
+ 1897  13F7  24 31             BIT VIDEO
+ 1898  13F9  10 06             BPL STATSER     ; No
+ 1899  13FB  20 C9 11          JSR Get_Chr_Polled
+ 1900  13FE  4C 04 14          JMP *+6
+ 1901  1401            STATSER
+ 1902  1401  20 E7 11          JSR Get_Chr
+ 1903  1404  B0 0A             BCS STATSCR3
+ 1904  1406  AD 00 C0          LDA DDPIA
+ 1905  1409  C5 2F             CMP LASTPIA
+ 1906  140B  F0 EA             BEQ STATSCR4  ;no change, no update
+ 1907  140D  4C CB 13          JMP STATSCR5
+ 1908  1410            STATSCR3
+ 1909  1410  29 5F             AND #$5F
+ 1910                          ;CMP #'R     ; READ TRACK/Show Part
+ 1911                          ;BNE *+8
+ 1912                          ;JSR VIEWTRK
+ 1913                          ;JMP STATSCR2
+ 1914  1412  C9 53             CMP #'S
+ 1915  1414  D0 0B             BNE CHECKLOAD
+ 1916  1416  A9 20             LDA #$20
+ 1917  1418  4D 02 C0          EOR DDPIA+2
+ 1918  141B  8D 02 C0          STA DDPIA+2
+ 1919  141E  4C C8 13          JMP STATSCR2
+ 1920  1421            CHECKLOAD
+ 1921  1421  C9 48             CMP #'H
+ 1922  1423  D0 0B             BNE CHKWRITE
+ 1923  1425  AD 02 C0          LDA DDPIA+2     ; PRESERVE DISK SEL BIT
+ 1924  1428  49 80             EOR #$80        ; TOGGLE HEAD LOAD
+ 1925  142A  8D 02 C0          STA DDPIA+2     
+ 1926  142D  4C C8 13          JMP STATSCR2
+ 1927  1430            CHKWRITE
+ 1928  1430  C9 57             CMP #'W
+ 1929  1432  D0 15             BNE CHKEXIT
+ 1930  1434  2C 00 C0          BIT DDPIA       ; WAIT 
+ 1931  1437  30 FB             BMI *-3 ; INDEX PULSE
+ 1932  1439  2C 00 C0          BIT DDPIA       ; WAIT END OF
+ 1933  143C  10 FB             BPL *-3 ; INDEX PULSE
+ 1934  143E  AD 02 C0          LDA DDPIA+2     ; PRESERVE DISK SEL BIT
+ 1935  1441  49 03             EOR #$03        ; TOGGLE WRITE AND ERASE ENABLE
+ 1936  1443  8D 02 C0          STA DDPIA+2     
+ 1937  1446  4C C8 13          JMP STATSCR2
+ 1938  1449            CHKEXIT
+ 1939  1449  C9 45             CMP #'E
+ 1940  144B  D0 0B             BNE CHKUP
+ 1941  144D  AD 02 C0          LDA DDPIA+2     ; PRESERVE DISK SEL BIT
+ 1942  1450  09 A3             ORA #$A3        ; TURN OFF HEAD LOAD, SELECT, AND WRITE
+ 1943  1452  8D 02 C0          STA DDPIA+2     
+ 1944  1455  4C 98 03          JMP TOP
+ 1945  1458            CHKUP
+ 1946  1458  48                PHA
+ 1947  1459  A9 20             LDA #$20
+ 1948  145B  2C 02 C0          BIT DDPIA+2
+ 1949  145E  68                PLA
+ 1950  145F  F0 11             BEQ JSTATSCR2   ; Can't move head if drive not selected
+ 1951                  
+ 1952  1461  C9 55             CMP #'U
+ 1953  1463  D0 06             BNE *+8
+ 1954  1465  20 77 0F          JSR TNEXT       ; STEP TO NEXT TRACK
+ 1955  1468  4C C8 13          JMP STATSCR2
+ 1956  146B  C9 44             CMP #'D
+ 1957  146D  D0 06             BNE *+8
+ 1958  146F  20 55 0F          JSR TPREV   ; STEP TO PREV TRACK
+ 1959  1472            JSTATSCR2
+ 1960  1472  4C C8 13          JMP STATSCR2
+ 1961  1475  C9 5A             CMP #'Z
+ 1962  1477  D0 03             BNE *+5
+ 1963  1479  20 13 0F          JSR TZERO    ; STEP TO TRACK 0
+ 1964  147C  4C C8 13          JMP STATSCR2
+ 1965                           
+ 1966                  
+ 1967                  ;VIEWTRK ;placeholder for View Track function   
+ 1968                  ;       RTS     
+ 1969  147F            BUFFER  =       *
+ 1970  147F            *=*+BYTES8 ;space for track buffer
+ 1971  228F            BUFFER2 =       *
+ 1972                  ;space for track buffer. We may write more data than this but will not
+ 1973                  ;use the extra data written. Don't put anything that can't be overwritten
+ 1974                  ;after this
+ 1975  228F            *=*+[BYTES8+BYTES8+2] 
+ 1976                  
+ 1977                  ;*=*+[MAXPAG8*2*256] ;space for track buffer
+ 1978                  
+ 1979  3EB1            .END
+
+Errors   = 0
+Warnings = 0
