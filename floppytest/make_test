@@ -1,0 +1,10 @@
+rm osifloppytest.bin
+rm osifloppytest.ser
+rm osifloppytest.lod
+
+A65/a65 -B -O osifloppytest.asm
+#osialod -f -l0400 -g0400 osifloppytest.bin -a osifloppytest.SER
+./convser osifloppytest.lod osifloppytest.ser
+A65/a65 -L -p0 osifloppytest.asm
+
+scp osifloppytest.lod win10:
