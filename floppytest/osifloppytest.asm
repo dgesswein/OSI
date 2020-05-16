@@ -13,7 +13,11 @@
 ;
 ; DESTRUCTIVE DISK READ/WRITE TEST
 ; By David Gesswein djg@pdp8online.com
-; Initial release 05/04/2020
+; Initial release V1.0 05/04/2020
+; V1.1 05/16/2020. Fixed ANYKEY not aborting. Prevent specifying illegal
+;    track to test. Fixed printing false errors when no data read.
+;    Fixed issues with serial console getting selected on video system.
+
 ; All my changes are released as public domain. The original code did not have
 ; any license specified.
 ; For usage see http://www.pdp8online.com/osi/osi-floppy-test.shtml
@@ -120,7 +124,7 @@ SERTYP=*+1
 	; First try to determine if a serial port exists. If it does we
 	; print a message to both serial and video and see which the user
 	; hits a key on to select between video and serial
-	LDX 	#2	; 2*1.25MS wait for last character to be output
+	LDX 	#10	; 10*1.25MS wait for last character to be output
 	JSR 	DELAY
 	LDX	#0
 	JSR	CheckTXReady	; If serial not ready likely no serial port
@@ -128,10 +132,10 @@ SERTYP=*+1
 	DEX			; so don't write to serial.
 SELLP
 	JSR	Get_Chr		; Flush serial data if any
-	JSR	Get_Chr		; Flush serial data if any
 	STX	VIDEO		; Select serial first then video
 	JSR	PRINT
 	.BYTE	CR,LF,'HIT ANY KEY TO SELECT CONSOLE DEVICE',CR,LF,0
+	JSR	Get_Chr		; Flush serial data if any
 	DEX
 	CPX	#$FE		; If we did both then we are done
 	BNE	SELLP
@@ -248,6 +252,8 @@ TESTTRK
 	JSR GETDEC2
 	BCC TESTTRK
 	STA YHOLD
+	CMP MAXTRK	; Don't allow more than MAXTRK
+	BPL TESTTRK
 	JSR INITPIA
 	JSR SELDRV
 	JSR TZERO	; STEP TO TRACK 0
@@ -1128,13 +1134,16 @@ PNEG
 
 	SEC
 	LDA 	#0
-	; Bytes read shorted than expected so only check bytes read.
+	; Bytes read shorter than expected so only check bytes read.
 	SBC	BYTECNTR	
 	STA	BYTECNTR	; Convert to negative count
 	LDA	#0
 	SBC	BYTECNTR+1
 	STA	BYTECNTR+1
-	JMP	RCHKDATALP
+	BNE	RCHKDATALP
+	LDA	BYTECNTR
+	BNE	RCHKDATALP
+	JMP	PCRLF	; No bytes read, don't compare. Just print CRLF
 RCHKDATA
 	LDA	MTRKBYTES
 	STA	BYTECNTR
@@ -1166,6 +1175,7 @@ RCONT
 	INC	BYTECNTR+1
 	BNE	RCHKDATALP
 
+PRTERRCNT
 	LDA	ERRCNT	; Done compare, did we get any errors?
 	BNE	PERRCNT
 	LDA	ERRCNT+1
@@ -1514,8 +1524,10 @@ ANYKEY
 	.BYTE	CR,LF
 	.BYTE	'PRESS ANY KEY WHEN READY >',0
 	JSR	INKEY
+	PHA
 	JSR	PRINT
 	.BYTE 	CR,LF,0
+	PLA
 	RTS
 
 DRWMENU
