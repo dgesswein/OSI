@@ -13,8 +13,8 @@
 ;
 ; DESTRUCTIVE DISK READ/WRITE TEST
 ; By David Gesswein djg@pdp8online.com
-; Initial release V1.0 05/04/2020
-; V1.1 05/16/2020. Fixed ANYKEY not aborting. Prevent specifying illegal
+; Initial release V1.00 05/04/2020
+; V1.01 05/16/2020. Fixed ANYKEY not aborting. Prevent specifying illegal
 ;    track to test. Fixed printing false errors when no data read.
 ;    Fixed issues with serial console getting selected on video system.
 

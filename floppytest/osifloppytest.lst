@@ -13,10 +13,10 @@
    13                  ;
    14                  ; DESTRUCTIVE DISK READ/WRITE TEST
    15                  ; By David Gesswein djg@pdp8online.com
-   16                  ; Initial release V1.0 05/04/2020
-   17                  ; V1.1 05/16/2020. Fixed ANYKEY not aborting. Prevent specifying illegal
+   16                  ; Initial release V1.00 05/04/2020
+   17                  ; V1.01 05/16/2020. Fixed ANYKEY not aborting. Prevent specifying illegal
    18                  ;    track to test. Fixed printing false errors when no data read.
-   19                  ;    wait to make sure all serial data flushed before looking for key
+   19                  ;    Fixed issues with serial console getting selected on video system.
    20                  
    21                  ; All my changes are released as public domain. The original code did not have
    22                  ; any license specified.
@@ -128,7 +128,7 @@
   124                          ; First try to determine if a serial port exists. If it does we
   125                          ; print a message to both serial and video and see which the user
   126                          ; hits a key on to select between video and serial
-  127  0319  A2 02             LDX     #2      ; 2*1.25MS wait for last character to be output
+  127  0319  A2 0A             LDX     #10     ; 10*1.25MS wait for last character to be output
   128  031B  20 B4 0F          JSR     DELAY
   129  031E  A2 00             LDX     #0
   130  0320  20 2C 12          JSR     CheckTXReady    ; If serial not ready likely no serial port
@@ -136,23 +136,23 @@
   132  0325  CA                DEX                     ; so don't write to serial.
   133  0326            SELLP
   134  0326  20 F3 11          JSR     Get_Chr         ; Flush serial data if any
-  135  0329  20 F3 11          JSR     Get_Chr         ; Flush serial data if any
-  136  032C  86 31             STX     VIDEO           ; Select serial first then video
-  137  032E  20 C3 0F          JSR     PRINT
-  138  0331  0D 0A 48          .BYTE   CR,LF,'HIT ANY KEY TO SELECT CONSOLE DEVICE',CR,LF,0
-       0334  49 54 20  
-       0337  41 4E 59  
-       033A  20 4B 45  
-       033D  59 20 54  
-       0340  4F 20 53  
-       0343  45 4C 45  
-       0346  43 54 20  
-       0349  43 4F 4E  
-       034C  53 4F 4C  
-       034F  45 20 44  
-       0352  45 56 49  
-       0355  43 45 0D  
-       0358  0A 00     
+  135  0329  86 31             STX     VIDEO           ; Select serial first then video
+  136  032B  20 C3 0F          JSR     PRINT
+  137  032E  0D 0A 48          .BYTE   CR,LF,'HIT ANY KEY TO SELECT CONSOLE DEVICE',CR,LF,0
+       0331  49 54 20  
+       0334  41 4E 59  
+       0337  20 4B 45  
+       033A  59 20 54  
+       033D  4F 20 53  
+       0340  45 4C 45  
+       0343  43 54 20  
+       0346  43 4F 4E  
+       0349  53 4F 4C  
+       034C  45 20 44  
+       034F  45 56 49  
+       0352  43 45 0D  
+       0355  0A 00     
+  138  0357  20 F3 11          JSR     Get_Chr         ; Flush serial data if any
   139  035A  CA                DEX
   140  035B  E0 FE             CPX     #$FE            ; If we did both then we are done
   141  035D  D0 C7             BNE     SELLP
