@@ -14,6 +14,11 @@
 ; DESTRUCTIVE DISK READ/WRITE TEST
 ; By David Gesswein djg@pdp8online.com
 ; Initial release V1.00 05/04/2020
+; V1.02 05/28/2020. Fixes from Mark Spankus. Fixed W in status test hanging if
+;    drive not selected. Fixed C1 serial I/O code. Simplified code. Fixed
+;    polled keyboard code to work reliably on C1 and other machines. Fixed
+;    video to work with C1P though messages may not fit in 30 columns. Fixed
+;    video for SYNMON, SYN600, and CEGMON.
 ; V1.01 05/16/2020. Fixed ANYKEY not aborting. Prevent specifying illegal
 ;    track to test. Fixed printing false errors when no data read.
 ;    Fixed issues with serial console getting selected on video system.
@@ -56,26 +61,25 @@ DRVNUM  =   STORE+04 ;1 drive# 0-3
 TRK     =   STORE+05 ;1 current track #
 TMP     =   STORE+6  ;1
 MACHINE =   STORE+7  ;1 C1/C2/C3 flag 00=C2/4/8, $40=C3Ser, $80=C1
+INVKEYB =   STORE+8  ;C1 polled = FF C2 polled = 00
 
-
-        *= STORE+8
+		*= STORE+9
 VIDEO		.BYTE 0 ; 0 = Serial $FF = video
-PATSEL  	.BYTE 0 ;  0 = Fixed byte (PATVAL), $FF = random
+PATSEL		.BYTE 0 ;  0 = Fixed byte (PATVAL), $FF = random
 PATVAL		.BYTE 0 ;  Byte to write to disk
 PASSES		.BYTE 0
 READONLY	.BYTE 0 ; zero read write
 PASSCNTR	.BYTE 0
 RND		.BYTE 92, 159, 137, 36, 210, 89
 RNDHLD		.BYTE 0,0,0,0,0,0
-DIVIDEND 	.BYTE 0,0,0
-;DIVISOR 	.BYTE 0,0,0
-DIVISOR 	.BYTE $f6,$5c,0
-REMAINDER 	.BYTE 0,0,0
-factor2 	.BYTE 0,0,0
-PZTEMP 	 	.BYTE 0
-MAX	 	.BYTE 0,0,0
-MIN	 	.BYTE 0,0,0
-SUM	 	.BYTE 0,0,0
+DIVIDEND	.BYTE 0,0,0
+DIVISOR		.BYTE 0,0,0
+REMAINDER	.BYTE 0,0,0
+factor2		.BYTE 0,0,0
+PZTEMP		.BYTE 0
+MAX		.BYTE 0,0,0
+MIN		.BYTE 0,0,0
+SUM		.BYTE 0,0,0
 pad		.BYTE 0
 ERRCNT		.WORD 0
 PRTERR		.BYTE 0
@@ -91,13 +95,15 @@ YHOLD		.BYTE 0
 TESTTYPE	.BYTE 0	; 0 normal 1 scope
 
 ;zero page storage
-DRVACIA 	.BYTE 0 ; Current serial word format for DISK ACIA 8E1/8N1
+DRVACIA		.BYTE 0 ; Current serial word format for DISK ACIA 8E1/8N1
 PTRSTOR		.WORD 0 
-TDATA  		.WORD 0
-TDATA2 		.WORD 0
+TDATA		.WORD 0
+TDATA2		.WORD 0
 VIDSRC		.WORD $D040
 VIDDST		.WORD $D000
 VIDOFFSET	.BYTE 0
+VIDXLEN		.BYTE 0
+VIDXMAX		.BYTE 0
 MAXERR		.BYTE 0 ; number of errors + 1 to print
 SINGLETRK	.BYTE 0; non zero if testing single track
 
@@ -108,24 +114,30 @@ SINGLETRK	.BYTE 0; non zero if testing single track
 	*=	ORG
 	.EXE *        ;A65 emit OSI .lod start address operation
 	SEI
+	JSR	VIDINIT
 	LDA	$FE01     ;determine machine type
 	BEQ	SERTYP    ;Is this serial system?                                                    
-	LDA	#$00	
+	LDA	#$00
+	TAX
+	STA	$DF00	
 	BIT	$DF00	  ;okay check C1/C2-C4
 	BMI	C1TYPE
+	INX
 C1TYPE=*+1
-	BIT	$80A9	  ;
+	BIT	$80A9
 SERTYP=*+1
 	BIT	$40A9
+	DEX
 	STA	MACHINE	  ;bit 7 = C1, bit 6 = C3, none =C2/C4
+	STX	INVKEYB
 	LDA	#$15      ;B1 = 8N2 /16 RTStxIRQ  rxIRQ ;$15 = 8N1 /16 RTSNOtxIRQ NOrxIRQ; $B5 = irqs on 8N1
 	STA	ACIACTL
 	; Not sure how to figure out if we should use serial or video.
 	; First try to determine if a serial port exists. If it does we
 	; print a message to both serial and video and see which the user
 	; hits a key on to select between video and serial
-	LDX 	#10	; 10*1.25MS wait for last character to be output
-	JSR 	DELAY
+	LDX	#10	; 10*1.25MS wait for last character to be output
+	JSR	DELAY
 	LDX	#0
 	JSR	CheckTXReady	; If serial not ready likely no serial port
 	BCS	SELLP		
@@ -142,7 +154,7 @@ SELLP
 SELLP2
 	JSR	Get_Chr		; Get serial character if one ready
 	BCS	SERCON		; Got one, select serial
-	JSR	Get_Chr_Polled	; Check polled keyboard for key down
+	JSR	Check_Keypress	; Check polled keyboard for key down
 	BCC	SELLP2		; Didn't find it
 	LDX	#$FF
 	LDY	#4		; Set video console and # of errors to print
@@ -155,17 +167,17 @@ STORECON
 	STY	MAXERR
 
 	LDA	#$00	; Reset various variables
-	STA	VIDOFFSET
 	STA	DRVNUM
-	STA     PATSEL
+	STA	PATSEL
 	STA	TESTTYPE
 	STA	READONLY
 	STA	TRK	; We don't know the track so set to zero
-	LDA     #$01
+
+	LDA	#$01
 	STA	PASSES
-	LDA     #$18
+	LDA	#$18
 	STA	PATVAL
-    	BIT	MACHINE
+	BIT	MACHINE
 	BVC	*+5
 	JMP	SETDRV8  ;serial systems use 8" by default
 	JMP	SETDRV5
@@ -283,9 +295,9 @@ SETPAT
 	JSR CONVHDIG
 	BCC SETPAT
 	ASL	; Shift to high nibble
-        ASL
-        ASL
-        ASL
+	ASL
+	ASL
+	ASL
 	TAX
 	JSR INKEY	; Get and combine with low nibble
 	JSR OUTPUT
@@ -392,17 +404,17 @@ NOTRK2
 	; We use 8N1 for 10 total bits.
 	; 8" = 25,000 characters per second and 5.25" 12,500.
 	; 16 measurements are done with minimum, maximum, and avarage
-        ; printed
+	; printed
 RPMTEST
 	JSR INITPIA
 	JSR SELDRV
 	JSR TZERO	; STEP TO TRACK 0
 	BCS NOTRK2
 	LDA #3
-	STA DDACIA  	; RESET ACIA
+	STA DDACIA	; RESET ACIA
 	LDA #$54    ;0 10 101 00 ;$54-  recv irq, RTS HIGH no xmit irq,  8N1,  DIVIDE BY 1,
 	STA DRVACIA	
-	STA DDACIA  	; SET DISK SERIAL WORD FORMAT/CLEAR FLAGS
+	STA DDACIA	; SET DISK SERIAL WORD FORMAT/CLEAR FLAGS
 	JSR PRINT
 	.BYTE $D,$A,'Head unloaded ',0
 	JSR RPMTST2
@@ -417,7 +429,7 @@ RPMTEST
 RPMUNLOAD
 	LDA DDPIA+2
 	ORA #$80	
-	STA	DDPIA+2	; UNLOAD DISK HEAD
+	STA DDPIA+2	; UNLOAD DISK HEAD
 	JMP TOP
 INDEXACT
 	JSR PRINT
@@ -461,8 +473,8 @@ RPMLP1
 	; Wait for index then write first byte to UART since it
 	; should be ready. Then write a second byte since it should either
 	; be ready immediatly or very shortly after first byte is transferred
-        ; to TX shift register. Then start counting with the writes that
-        ; will happen at the UART data rate.
+	; to TX shift register. Then start counting with the writes that
+	; will happen at the UART data rate.
 	INY
 	BNE *+4
 	ADC #1
@@ -472,12 +484,12 @@ RPMLP1
 	STA DDACIA+1	; WRITE BYTE, VALUE DON'T CARE
 RPMNDX0
 	LDA #2
-	AND DDACIA 	;test tx ready?	
+	AND DDACIA	;test tx ready?	
 	BEQ RPMNDX0	;not ready?
 	STA DDACIA+1	; WRITE BYTE, VALUE DON'T CARE
 RPMNDX1
 	LDA #2
-	AND DDACIA 	;test tx ready?	
+	AND DDACIA	;test tx ready?	
 	BEQ RPMNDX1	;not ready?
 	STA DDACIA+1	; WRITE BYTE, VALUE DON'T CARE
 	INC DIVISOR
@@ -491,7 +503,7 @@ RPMNDX2
 	BIT DDPIA	; DONE IF 
 	BPL RPMNDX3	; INDEX PULSE
 	LDA #2
-	AND DDACIA 	;test tx ready?	
+	AND DDACIA	;test tx ready?	
 	BEQ RPMNDX2	;not ready?
 	STA DDACIA+1	; WRITE BYTE, VALUE DON'T CARE
 	INC DIVISOR	; Count character sent
@@ -641,7 +653,7 @@ DODIV
 	JSR OUTPUT
 	LDA #'0'
 	STA pad
-        LDY #2                       ; Print 2 digits
+	LDY #2                       ; Print 2 digits
 	JSR PrDec16Lp1
 	RTS
 	
@@ -682,7 +694,7 @@ PrDec16Lp1
 PrDec16Lp2
    LDA num+0
    SBC PrDec16Tens+0,Y
-   STA num+0  		; Subtract current tens
+   STA num+0		; Subtract current tens
    LDA num+1
    SBC PrDec16Tens+1,Y
    STA num+1
@@ -690,7 +702,7 @@ PrDec16Lp2
    BCS PrDec16Lp2       ; Loop until <0
    LDA num+0
    ADC PrDec16Tens+0,Y
-   STA num+0  		; Add current tens back in
+   STA num+0		; Add current tens back in
    LDA num+1
    ADC PrDec16Tens+1,Y
    STA num+1
@@ -701,7 +713,7 @@ PrDec16Lp2
    BNE PrDec16Digit     ; Not zero, print it
    LDA pad
    BNE PrDec16Print
-   BEQ PrDec16Next 	; pad<>0, use it
+   BEQ PrDec16Next	; pad<>0, use it
 PrDec16Digit
    LDX #'0
    STX pad              ; No more zero padding
@@ -732,18 +744,18 @@ TEST2
 	.BYTE	CR,LF
 	.BYTE	'INSERT DISK TO BE TESTED',CR,LF
 	.BYTE	'If errors found the output is DDDD (#### GG BBP)* EEEE',CR,LF
-        .BYTE   'where DDDD is difference between number of bytes written',CR,LF
-        .BYTE   'and read. EEEE is total errors, #### is byte count from', CR,LF
-        .BYTE   'start of track, GG is good byte, BB is bad byte,',CR,LF
-        .BYTE   'P is byte had parity error.',CR,LF
-        .BYTE   'Errors that fit on line are printed.',CR,LF
+	.BYTE   'where DDDD is difference between number of bytes written',CR,LF
+	.BYTE   'and read. EEEE is total errors, #### is byte count from', CR,LF
+	.BYTE   'start of track, GG is good byte, BB is bad byte,',CR,LF
+	.BYTE   'P is byte had parity error.',CR,LF
+	.BYTE   'Errors that fit on line are printed.',CR,LF
 	.BYTE   'ESC KEY OR ^X ABORTS...',CR,LF,0
 
 	JSR	ANYKEY
-        CMP     #$1B   ;ESC key?
-        BEQ     JMP2TOP
-        CMP     #$18   ;^X
-        BEQ     JMP2TOP
+	CMP     #$1B   ;ESC key?
+	BEQ     JMP2TOP
+	CMP     #$18   ;^X
+	BEQ     JMP2TOP
 
 
 	LDA	PASSES
@@ -773,7 +785,7 @@ TESTFILL
 TFILL	
 	LDA	PATVAL
 	BIT	PATSEL		; Fill with test pattern. 
-	BPL     TSTORE		; Always fills larger 8" number of bytes
+	BPL	TSTORE		; Always fills larger 8" number of bytes
 	JSR	RAND
 TSTORE
 	STA	(TDATA),Y
@@ -829,9 +841,9 @@ WRNEXT
 	STA	DDACIA  ; RESET ACIA
 	LDA	DRVACIA	; usually $58-DIVIDE BY 1, 8E1, RTS HIGH no IRQs
 	STA	DDACIA  ; SET DISK SERIAL WORD FORMAT/CLEAR FLAGS
-	LDX 	#1	; 0.8MS
+	LDX	#1	; 0.8MS
 	LDY	#$9E
-	JSR 	DELAY1
+	JSR	DELAY1
 	LDY	#0
 WRDATALP
 	BIT	DDPIA	; WAIT 
@@ -932,7 +944,7 @@ TREAD2
 	LDA	#1
 RDATALP2
 	BIT	DDPIA
-	BPL     NODATA		; INDEX PULSE
+	BPL	NODATA		; INDEX PULSE
 	BIT	DDACIA		; test tx ready?	
 	BEQ	RDATALP2
 	PHP
@@ -943,12 +955,12 @@ RDATALP2
 	PLP
 	BVS	SERROR		; Did it get a parity error
 	INY			; Skip this byte in checking since we checked
-	JMP 	RDATALP3
+	JMP	RDATALP3
 IGNBYTE
 	PLP
 RDATALP3
 	BIT	DDPIA
-	BMI     NOTINDEX2	; INDEX PULSE
+	BMI	NOTINDEX2	; INDEX PULSE
 	JMP	PCRONLY
 NOTINDEX2
 	LDA	#1
@@ -1024,7 +1036,7 @@ SERRWAIT
 	BNE	*+5
 	JMP	TOP
 	PHA
-	LDA	DDPIA+2  ; PRESERVE DISK SEL BIT
+	LDA	DDPIA+2	; PRESERVE DISK SEL BIT
 	AND	#$7F	; 0111 1111
 	STA	DDPIA+2	; LOAD DISK HEAD
 	LDX	#$FF	; 320MS
@@ -1042,7 +1054,7 @@ NORMREAD
 	LDY	#0
 RDATALP
 	BIT	DDPIA
-	BPL     RINDEX	; INDEX PULSE
+	BPL	RINDEX		; INDEX PULSE
 NOTINDEX
 	LDA	DDACIA		; test tx ready?	
 	STA	(TDATA2),Y	; store error data
@@ -1083,10 +1095,10 @@ CHKSTART
 	; This will skip up to 1 byte looking for $5A start of track flag
 	; The write turn on/off generates one byte of junk sometimes
 	JSR	RESPTR
-	LDA     BUFFER2+1
+	LDA	BUFFER2+1
 	CMP	#$5A		; Start of track flag
 	BEQ	NOSKIP
-	LDA     BUFFER2+3
+	LDA	BUFFER2+3
 	CMP	#$5A		; Start of track flag
 	BNE	NOSKIP		; No, assume read error
 	CLC
@@ -1098,7 +1110,7 @@ CHKSTART
 	STA	TDATA2+1	; and parity byte
 	LDA	BYTECNTR
 	BNE	*+4
-	DEC     BYTECNTR+1
+	DEC	BYTECNTR+1
 	DEC	BYTECNTR
 NOSKIP
 	CLC	; Print bytes read - bytes written. Skipped byte not
@@ -1133,7 +1145,7 @@ PNEG
 	JSR	PrDec16Lp1
 
 	SEC
-	LDA 	#0
+	LDA	#0
 	; Bytes read shorter than expected so only check bytes read.
 	SBC	BYTECNTR	
 	STA	BYTECNTR	; Convert to negative count
@@ -1205,7 +1217,7 @@ NEXTTRK
 	BEQ	TRDONE
 	JSR	TNEXT	; seek to next track
 JTREAD2
-	JMP     TREAD2
+	JMP	TREAD2
 TRDONE
 	LDA	#$80
 	ORA	DDPIA+2	; Unload head
@@ -1241,16 +1253,16 @@ RERROR
 	JSR	OUTPUT
 	LDY	#0
 	LDA	(TDATA),Y	; Good value
-	JSR 	PHEXA
+	JSR	PHEXA
 	LDA	#' '
 	JSR	OUTPUT
 	INY
 	LDA	(TDATA2),Y	; Bad value
 	DEY
-	JSR 	PHEXA
+	JSR	PHEXA
 	LDX	#' '
 	LDA	#$40
-	AND     (TDATA2),Y
+	AND	(TDATA2),Y
 	BEQ	*+4
 	LDX	#'P'		; Parity error
 	TXA
@@ -1376,30 +1388,30 @@ TZERO3
 	JSR	DELAY2
 	ORA	#8		; 0000 1000
 	STA	DDPIA+2	; SET 'STEP' PIN HIGH
-	LDX	#32 	; 40 MS
+	LDX	#32	; 40 MS
 	JSR	DELAY
 	BEQ	TZERO1	; ALWAYS
 
 ; STEP TO PREVIOUS TRACK
 TPREV
-        LDA     DDPIA+2 ; DIR=(TO TRK0)
-        ORA     #$04
-        STA     DDPIA+2 ; SET 'DIR' PIN
-        JSR     DELAY2
-        AND     #$F7    ; 1111 0111
-        STA     DDPIA+2 ; SET 'STEP' PIN LOW
-        JSR     DELAY2
-        ORA     #8              ; 0000 1000
-        STA     DDPIA+2 ; SET 'STEP' PIN HIGH
-        DEC	TRK
+	LDA     DDPIA+2 ; DIR=(TO TRK0)
+	ORA     #$04
+	STA     DDPIA+2 ; SET 'DIR' PIN
+	JSR     DELAY2
+	AND     #$F7    ; 1111 0111
+	STA     DDPIA+2 ; SET 'STEP' PIN LOW
+	JSR     DELAY2
+	ORA     #8              ; 0000 1000
+	STA     DDPIA+2 ; SET 'STEP' PIN HIGH
+	DEC	TRK
 	JSR	REDWR	; Set reduced write current
-        LDX     #32     ; 40 MS
-        JMP     DELAY
+	LDX     #32     ; 40 MS
+	JMP     DELAY
 
 ; STEP TO NEXT TRACK
 
 TNEXT	
-	LDA DDPIA+2
+	LDA	DDPIA+2
 	AND	#$FB	; 1111 1011
 				; DIR=INWARDS
 	STA	DDPIA+2	; SET 'DIR' PIN
@@ -1458,8 +1470,8 @@ PRINT1
 	JSR	OUTPUT
 	INY
 	BNE	PRINT1
-	INC PTRSTOR+1
-	BNE PRINT1
+	INC	PTRSTOR+1
+	BNE	PRINT1
 PRINT2	
 	TYA
 	SEC
@@ -1540,7 +1552,7 @@ DRWMENU
 	.BYTE '3. Select Drive',$D,$A      
 	.BYTE '4. Set Drive Type',$D,$A      
 	.BYTE '5. Set Pattern and passes',$D,$A
-        .BYTE '6. Toggle read only',$D,$A
+	.BYTE '6. Toggle read only',$D,$A
 	.BYTE '7. RPM Test',$D,$A 
 	.BYTE '8. Status screen',$D,$A 
 	.BYTE '9. Exit',$D,$A          
@@ -1600,27 +1612,46 @@ PPROMPT
 	; Get key from polled key without waiting. Carry clear if no key
 	; Key returned in A. X,Y modified
 Get_Chr_Polled
-	LDA #2		; Ignore shift lock
-	LDY #0
-Check_Polled_Loop
-	STA $DF00	; Select row
-	STA $DF00	; In case some time needed for signals to propagate
-	LDX $DF00
-	BEQ Polled_No_Key	; Jmp if no pressed?
-	INY
-Polled_No_Key
-	ASL
-	BNE Check_Polled_Loop
-	CPY #1		; If we found other than 1 key pressed assume no
-			; key pressed. May not have a keyboard port
-	BEQ Polled_Got_Key
-	CLC
-	RTS
-Polled_Got_Key
-	JSR $FEED
+	JSR Check_Keypress	;any pressed keys?
+	BCC NOKEY		;no, dont get stuxk in keypoller
+	JSR $FEED		;yes - check keypoller
+	PHA
+UNKEY
+	JSR Check_Keypress  ;wait till key unpressed to prevent getting stuck in poller
+	BCS UNKEY
+	PLA
+HAVEKEY
 	SEC
 	RTS
-	
+
+Check_Keypress
+	LDA #$3E    ;want rows 5,4,3,2,1 tested (most alpha keys)
+	EOR INVKEYB
+	STA $DF00	; Select row
+	STA $DF00	; In case some time needed for signals to propagate
+	LDA $DF00
+	EOR INVKEYB ;C1 keyboard inverted
+	PHA
+	LDA #$00	;selected all rows
+	EOR INVKEYB
+	STA $DF00
+	PLA
+	BEQ NOKEY	; bail if no key pressed
+	LDY #$07	; count bits 7 to 1
+	LDX #$00
+DEKEY
+	ASL A
+	BCC *+3
+	INX
+	DEY
+	BNE DEKEY
+	CPX #$01	;x has # cols pressed
+	BNE NOKEY	;more than one or none = nokey
+	SEC 
+	RTS
+NOKEY
+	CLC
+	RTS	
 
 Get_Chr
 FRACIANW  ; read from ACIA no wait	carry clear when no data
@@ -1643,13 +1674,13 @@ INKEY
 	BIT VIDEO
 	BPL *+5		; No
 	JMP $FEED	; Polled keyboard
+FRACIA  	 ;read from ACIA carry set on abort return value in A
 	BIT MACHINE
-FRACIA   	 ;read from ACIA carry set on abort return value in A
 	BMI FRAC1
 FRSER			; read from C3
 	LDA C2ACIA
 	LSR A    
-	BCC FRACIA 
+	BCC FRSER 
 	LDA C2ACIA+1
 	CLC      
 ACIARET
@@ -1657,7 +1688,7 @@ ACIARET
 FRAC1			;read from C1
 	LDA C1ACIA
 	LSR A    
-	BCC FRACIA 
+	BCC FRAC1 
 	LDA C1ACIA+1
 	CLC       
 	RTS
@@ -1678,12 +1709,10 @@ TOAC1B
 
 	; Write a character to serial or video. A modified
 OUTPUT
-Put_Chr
-TOACIA    
 	BIT VIDEO
-	BPL TOACIA2	; No, not video system
+	BPL TOACIA	; No, not video system
 	JMP VIDOUT
-TOACIA2
+TOACIA
 	PHA
 	BIT MACHINE
 	BMI TOAC1
@@ -1705,6 +1734,72 @@ TOAC1
 	RTS 
 
 	; Video output routine
+	; video init for SYN600, SYNMON, CEGMON
+	; $FFE0 - cursor start
+	; $FFE1 - line len-1   (wrap position)
+	; $FFE2 - 00 = 1K vid, 01=2K vid otherwise serial or other ROM
+	; FFE0 65, 17, 00 (c1 ROM, cegmon)
+	; FFE0 40, 3F, 01 (c2 ROM)
+	; FFE0 4D, 2F, 01 (C1E cegmon 64x32)
+VIDINIT
+	LDA #$00
+	STA VIDOFFSET
+	STA VIDDST
+	LDX $FFE2
+	BEQ C1VID ;1k screen
+	DEX
+	BEQ C2VID
+	
+
+WHATVID	;assume C2-like video
+	LDA #$00
+	STA VIDCR+1 ;cursor start
+	STA VIDOFFSET
+	LDA #$40	;linelen
+	STA VIDXMAX
+	LDX #$D7    ;bottom line hi
+	LDY #$80    ;bottom line low
+	BNE VIDINI2
+	
+C2VID			;C2VID	2k screen
+	LDA #$40	;linelen
+	LDX #$D7    ;bottom line hi
+	BNE VIDINI1
+	
+	
+C1VID	;C1VID  1K screen
+	LDA #$20
+	LDX #$D3
+
+VIDINI1	;read video settings from ROM
+	PHA	
+	LDA $FFE0
+	TAY
+	AND #$0F
+	STA VIDCR+1 ;cursor start
+	SEC
+	ADC $FFE1
+	STA VIDXMAX
+	TYA
+	AND #$F0
+	TAY         ;bottom line low
+	STA VIDOFFSET
+	PLA
+
+VIDINI2	
+
+	STA VIDXLEN
+	STA VIDSRC
+
+	STX VIDCLR+2  ;D3E0 or D780
+	STY VIDCLR+1  
+	STX VIDFIX1+1 ;D3E0 or D780
+	STY VIDFIX1
+	LDA #$D0
+	STA VIDSRC+1  ;init to D040 or D020
+	STA VIDDST+1  ;init to D000
+	RTS
+	
 VIDOUT
 	STY YHOLD 
 	CMP #CR
@@ -1712,34 +1807,65 @@ VIDOUT
 	CMP #LF
 	BEQ VIDLF
 	LDY VIDOFFSET
+VIDFIX1=*+1
 	STA $D6C0,Y
 	INY
 	STY VIDOFFSET
+	CPY VIDXMAX
+	BNE VIDRETY
+	JSR VIDCR
+	JMP VIDLF
 VIDRETY
 	LDY YHOLD
 	RTS
 VIDCR
 	LDA #0
 	STA VIDOFFSET
-	RTS	
+	RTS
+
 VIDLF
-	LDA (VIDSRC),Y
+	LDY #$00
+VIDLF1
+	LDA (VIDSRC),Y  ;copy row by row
 	STA (VIDDST),Y
 	INY
-	BNE VIDLF
+	CPY VIDXLEN
+	BNE VIDLF1
+	TYA
+	CLC
+	ADC VIDSRC
+	STA VIDSRC
+	BCC VIDLF2
 	INC VIDSRC+1
+VIDLF2
+	TYA
+	CLC
+	ADC VIDDST
+	STA VIDDST
+	BCC VIDLF3
 	INC VIDDST+1
-	LDA VIDSRC+1
-	CMP #$D7
-	BNE VIDLF
+VIDLF3	
+
+	LDA VIDDST+1
+	CMP VIDCLR+2
+	BNE VIDLF1-2
+	LDA VIDDST
+	CMP VIDCLR+1
+	BNE VIDLF1-2
+
 	LDA #$D0
 	STA VIDSRC+1
 	STA VIDDST+1
+	LDA #$00
+	STA VIDDST
+	LDA VIDXLEN
+	STA VIDSRC
+
 	LDA #' '
 VIDCLR
 	STA $D6C0,Y	; Clear last line
 	INY
-	CPY #$40
+	CPY VIDXLEN
 	BNE VIDCLR
 	INY
 	JMP VIDRETY
@@ -1863,8 +1989,8 @@ LASTPIA = TMP ; need a storage location
 STATSCRN
 	LDA #$AA
 	STA LASTPIA
-        JSR INITPIA	; Select disk
-        JSR SELDRV
+	JSR INITPIA	; Select disk
+	JSR SELDRV
 	LDA #$20	; Turn master select back off
 	EOR DDPIA+2
 	STA DDPIA+2
@@ -1880,7 +2006,6 @@ STATSCRN
 	.BYTE '1 0 L T 2 T 1 E',$D, $A
 	.BYTE '    T     P   X',$D, $A
 	.BYTE 0
-        ;, $1B, $48,0
 
 STATSCR2
 	LDA DDPIA
@@ -1919,58 +2044,62 @@ STATSER
 	JMP STATSCR5
 STATSCR3
 	AND #$5F
+	TAX
 	;CMP #'R     ; READ TRACK/Show Part
 	;BNE *+8
 	;JSR VIEWTRK
 	;JMP STATSCR2
-	CMP #'S
+	CPX #'S
 	BNE CHECKLOAD
 	LDA #$20
 	EOR DDPIA+2
 	STA DDPIA+2
 	JMP STATSCR2
 CHECKLOAD
-	CMP #'H
+	CPX #'H
 	BNE CHKWRITE
 	LDA DDPIA+2	; PRESERVE DISK SEL BIT
 	EOR #$80	; TOGGLE HEAD LOAD
 	STA DDPIA+2	
 	JMP STATSCR2
 CHKWRITE
-	CMP #'W
+	CPX #'W
 	BNE CHKEXIT
+	LDA #$20
+	BIT DDPIA+2 ;TEST DRIVE SEL
+	BEQ WRITNOIDX
 	BIT DDPIA	; WAIT 
 	BMI *-3	; INDEX PULSE
 	BIT DDPIA	; WAIT END OF
 	BPL *-3	; INDEX PULSE
+WRITNOIDX
 	LDA DDPIA+2	; PRESERVE DISK SEL BIT
 	EOR #$03	; TOGGLE WRITE AND ERASE ENABLE
 	STA DDPIA+2	
 	JMP STATSCR2
 CHKEXIT
-	CMP #'E
+	CPX #'E
 	BNE CHKUP
 	LDA DDPIA+2	; PRESERVE DISK SEL BIT
 	ORA #$A3	; TURN OFF HEAD LOAD, SELECT, AND WRITE
 	STA DDPIA+2	
 	JMP TOP
+
 CHKUP
-	PHA
 	LDA #$20
 	BIT DDPIA+2
-	PLA
 	BEQ JSTATSCR2	; Can't move head if drive not selected
 
-	CMP #'U
+	CPX #'U
 	BNE *+8
 	JSR TNEXT	; STEP TO NEXT TRACK
 	JMP STATSCR2
-	CMP #'D
+	CPX #'D
 	BNE *+8
 	JSR TPREV   ; STEP TO PREV TRACK
 JSTATSCR2
 	JMP STATSCR2
-	CMP #'Z
+	CPX #'Z
 	BNE *+5
 	JSR TZERO    ; STEP TO TRACK 0
 	JMP STATSCR2
