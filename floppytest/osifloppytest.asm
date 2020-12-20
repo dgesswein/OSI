@@ -1625,6 +1625,8 @@ HAVEKEY
 	RTS
 
 Check_Keypress
+	BIT MACHINE
+	BVS NOKEY	;don't poll C3 machine
 	LDA #$3E    ;want rows 5,4,3,2,1 tested (most alpha keys)
 	EOR INVKEYB
 	STA $DF00	; Select row
