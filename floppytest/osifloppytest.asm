@@ -1,6 +1,6 @@
 ;
 ; DISK TEST UTILITY FOR C1P/UK101/C2PDF/C4PMF/C8P/C3-OEM
-; Supposed to work with serial or video and 8" or 5.25" floppies. Tested 
+; Supposed to work with serial or video and 8", 5.25", or 3.5" floppies. Tested
 ; with C2 with 8" floppies, serial, and 540B video. Tested with OSI emulator
 ; with 5.25" floppies.
 ; Needs 16k memory.
@@ -14,6 +14,7 @@
 ; DESTRUCTIVE DISK READ/WRITE TEST
 ; By David Gesswein djg@pdp8online.com
 ; Initial release V1.00 05/04/2020
+; V1.03 07/18/2020. Experimental support for 3.5" drives from Jeff Tranter.
 ; V1.02 05/28/2020. Fixes from Mark Spankus. Fixed W in status test hanging if
 ;    drive not selected. Fixed C1 serial I/O code. Simplified code. Fixed
 ;    polled keyboard code to work reliably on C1 and other machines. Fixed
@@ -38,8 +39,11 @@ MAXTRK5	=	40	; # TRACKS TO READ 5 1/4 disk
 MAXPAG5	=	10	; # PAGES TO READ  5 1/4 disk
 MAXTRK8 =   77	; # Tracks to read 8 disk
 MAXPAG8 =   15	; # Pages to read 8 disk
+MAXTRK3 =	80	; # Tracks to read 3 1/2 disk
+MAXPAG3 =	16	; # Pages to read 3 1/2 disk
 BYTES5	= 2167
 BYTES8  = 3600
+BYTES3  = 4300
 
 DDPIA	=   $C000   ; Disk controller PIA
 DDACIA  =   $C010   ; Disk Controller Serial Port
@@ -87,6 +91,10 @@ PRTERR		.BYTE 0
 RPMSCALE8	.BYTE $60, $e3, $16 
 ; 5.25" RPM scale 300 * (125000/10/5) = 750000
 RPMSCALE5	.BYTE $b0, $71, $0b 
+; 3.5" 720KB RPM scale 300 RPM * (250000 bps/10 bits/byte/5 RPS) = 1500000
+RPMSCALE3       .BYTE $60, $e3, $16
+; 3.5" 1.44MB RPM scale 300 RPM * (500000 bps/10 bits/byte/5 RPS) = 3000000
+;RPMSCALE3       .BYTE $c0, $c6, $2d
 ; Allow 3% fast rotation and 1.25 delay after index high and 2.2 ms index
 ; pulse;
 MTRKBYTES	.WORD 0	; negative number of bytes in track
@@ -223,13 +231,15 @@ CHECKNEXT
 
 DRVTYPE
 	JSR	PRINT
-	.BYTE $D,$A,'Enter your disk drive type (8) inch or (5).25 inch? >',0
+	.BYTE $D,$A,'Enter your disk drive type (8) inch, (5).25 inch, or (3).5 inch? >',0
 	JSR	INKEY
 	JSR	OUTPUT
 	CMP	#$38
 	BEQ	SETDRV8
 	CMP	#$35
 	BEQ	SETDRV5
+	CMP	#$33
+	BEQ	SETDRV3
 INPERR
 	LDA	#'?	; Print bad choice and menu again
 	JSR	OUTPUT
@@ -254,6 +264,17 @@ SETDRV8
 	LDA	#-BYTES8%256
 	STA	MTRKBYTES
 	LDA	#-BYTES8/256
+	STA	MTRKBYTES+1
+	JMP	TOP
+
+SETDRV3
+	LDA	#MAXTRK3
+	STA	MAXTRK
+	LDA	#MAXPAG3
+	STA	MAXPAG
+	LDA	#-BYTES3%256
+	STA	MTRKBYTES
+	LDA	#-BYTES3/256
 	STA	MTRKBYTES+1
 	JMP	TOP
 
@@ -402,7 +423,7 @@ NOTRK2
 	; We count number of bytes sent through disk serial port between
 	; index pulses to measure RPM. That is independent of CPU speed.
 	; We use 8N1 for 10 total bits.
-	; 8" = 25,000 characters per second and 5.25" 12,500.
+	; 8" = 25,000 characters per second, 5.25" 12,500, and 3.5" 50,000
 	; 16 measurements are done with minimum, maximum, and avarage
 	; printed
 RPMTEST
@@ -623,7 +644,18 @@ RPMPRT
 	LDA MAXPAG
 	CMP #MAXPAG8
 	BEQ RPM8
-	LDA RPMSCALE5
+	CMP #MAXPAG5
+	BEQ RPM5
+
+	LDA RPMSCALE3
+	STA DIVIDEND
+	LDA RPMSCALE3+1
+	STA DIVIDEND+1
+	LDA RPMSCALE3+2
+	STA DIVIDEND+2
+	JMP DODIV
+
+RPM5	LDA RPMSCALE5
 	STA DIVIDEND
 	LDA RPMSCALE5+1
 	STA DIVIDEND+1
@@ -1565,7 +1597,13 @@ DRWMENU
 	LDA MAXPAG
 	CMP #MAXPAG8
 	BEQ DRWMN1
+	CMP #MAXPAG5
+	BEQ DRWMN0
 	JSR PRINT
+	.BYTE '/3.5 ',0
+	BCC DRWMN2
+
+DRWMN0	JSR PRINT
 	.BYTE '/5.25 ',0
 	BCC DRWMN2
 DRWMN1
