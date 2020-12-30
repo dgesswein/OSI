@@ -14,6 +14,8 @@
 ; DESTRUCTIVE DISK READ/WRITE TEST
 ; By David Gesswein djg@pdp8online.com
 ; Initial release V1.00 05/04/2020
+; V1.04 12/28/2020. Fix from Mark Spankus to not check for polled keyboard
+;    on C3. Also some comment changes by DJG.
 ; V1.03 07/18/2020. Experimental support for 3.5" drives from Jeff Tranter.
 ; V1.02 05/28/2020. Fixes from Mark Spankus. Fixed W in status test hanging if
 ;    drive not selected. Fixed C1 serial I/O code. Simplified code. Fixed
@@ -37,8 +39,8 @@ ORG	=	$0300
 
 MAXTRK5	=	40	; # TRACKS TO READ 5 1/4 disk
 MAXPAG5	=	10	; # PAGES TO READ  5 1/4 disk
-MAXTRK8 =   77	; # Tracks to read 8 disk
-MAXPAG8 =   15	; # Pages to read 8 disk
+MAXTRK8 =	77	; # Tracks to read 8 disk
+MAXPAG8 =	15	; # Pages to read 8 disk
 MAXTRK3 =	80	; # Tracks to read 3 1/2 disk
 MAXPAG3 =	16	; # Pages to read 3 1/2 disk
 BYTES5	= 2167
@@ -423,7 +425,8 @@ NOTRK2
 	; We count number of bytes sent through disk serial port between
 	; index pulses to measure RPM. That is independent of CPU speed.
 	; We use 8N1 for 10 total bits.
-	; 8" = 25,000 characters per second, 5.25" 12,500, and 3.5" 50,000
+	; 8" = 25,000 characters per second, 5.25" 12,500, 3.5" 720k 25,000 
+        ; 3.5" 1.44M (not yet supported) 50,000.
 	; 16 measurements are done with minimum, maximum, and avarage
 	; printed
 RPMTEST
@@ -1655,7 +1658,7 @@ Get_Chr_Polled
 	JSR $FEED		;yes - check keypoller
 	PHA
 UNKEY
-	JSR Check_Keypress  ;wait till key unpressed to prevent getting stuck in poller
+	JSR Check_Keypress  ;wait till key unpressed to prevent reading key twice 
 	BCS UNKEY
 	PLA
 HAVEKEY
@@ -1665,14 +1668,14 @@ HAVEKEY
 Check_Keypress
 	BIT MACHINE
 	BVS NOKEY	;don't poll C3 machine
-	LDA #$3E    ;want rows 5,4,3,2,1 tested (most alpha keys)
+	LDA #$FE	;want all except first row with shift lock
 	EOR INVKEYB
 	STA $DF00	; Select row
 	STA $DF00	; In case some time needed for signals to propagate
 	LDA $DF00
 	EOR INVKEYB ;C1 keyboard inverted
 	PHA
-	LDA #$00	;selected all rows
+	LDA #$00	;Deselect all rows
 	EOR INVKEYB
 	STA $DF00
 	PLA
