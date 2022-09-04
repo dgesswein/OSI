@@ -1,0 +1,8 @@
+
+A65 65C02 Assembler 1.23.1  2022-08-17
+
+Pass 1 osifloppytest.asm
+Pass 2 osifloppytest.asm
+
+Errors   = 0
+Warnings = 0

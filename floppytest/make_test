@@ -1,10 +1,19 @@
 rm osifloppytest.bin
-rm osifloppytest.ser
+rm osifloppytest.65a
 rm osifloppytest.lod
+rm osifloppytest.lst
 
-A65/a65 -B -O osifloppytest.asm
-#osialod -f -l0400 -g0400 osifloppytest.bin -a osifloppytest.SER
-./convser osifloppytest.lod osifloppytest.ser
+# create .lod for OSI65V
+A65/a65 -O osifloppytest.asm
+
+#create .65A serial loading file for OSI65A
+A65/a65 -A osifloppytest.asm
+#create listing
 A65/a65 -L -p0 osifloppytest.asm
 
-scp osifloppytest.lod win10:
+# create bootable disks & file comments
+#./bootthis -5 -l0300 -e0300 -n"  OSI FLOPPY TEST   BY  DAVID GESS-  WEIN" -o osifloppytest.bin DiskTest5.65D
+#./bootthis -8 -l0300 -e0300 -n"  OSI FLOPPY TEST   BY  DAVID GESS-  WEIN" -o osifloppytest.bin DiskTest8.65D
+
+#For my testing
+#scp osifloppytest.lod win10:

@@ -1,4 +1,0 @@
-#!/bin/bash
-#RG changed to R
-sed  's"^\.\(....\)/"L\1"' $1 | sed  's"\.\(....\)/"RL\1"g' | sed  's"\.....G"R"' | sed 's"\r""g' > $2
-
