@@ -89,7 +89,7 @@ MAXTRK3 =   80     ; # Tracks to read 3 1/2 disk
 MAXPAG3 =   16     ; # Pages to read 3 1/2 disk
 BYTES5  = 2167
 BYTES8  = 3600
-BYTES3  = 4300
+BYTES3  = 3600
 
 DDPIA   =   $C000   ; Disk controller PIA
 DDACIA  =   $C010   ; Disk Controller Serial Port
